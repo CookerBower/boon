@@ -1,6 +1,5 @@
 """Stat query validation, acquisition, result types, and native errors."""
 
-import io
 import json
 from typing import cast
 
@@ -8,7 +7,7 @@ import polars as pl
 import pytest
 from boon import CalculationError, Demo, HeroStat, StatMode, data, rulesets
 from boon.hero_stats import calculate_hero_stats
-from catalog_helpers import VERSION, release
+from catalog_helpers import VERSION, catalog_upstream, write_empty_catalogs
 
 
 class RecordedResult:
@@ -50,7 +49,9 @@ class RecordedResult:
 def test_contributions_retain_target_stats_for_shared_inputs(monkeypatch, tmp_path):
     class Contributions(RecordedResult):
         def _calculate_hero_stats(self, directory, ticks, **kwargs):
-            payload = json.loads(super()._calculate_hero_stats(directory, ticks, **kwargs))
+            payload = json.loads(
+                super()._calculate_hero_stats(directory, ticks, **kwargs)
+            )
             payload["contributions"] = [
                 {
                     "mode": kwargs["mode"],
@@ -78,52 +79,70 @@ def test_contributions_retain_target_stats_for_shared_inputs(monkeypatch, tmp_pa
         explain=True,
     )
     assert report.contributions["stat"].to_list() == ["clip_size", "weapon_damage"]
-    assert report.contributions.filter(pl.col("stat") == "weapon_damage").height == 1
     assert report.contributions["input"].to_list() == ["spirit_power", "spirit_power"]
 
 
-def test_query_uses_verified_download_and_reuses_local_catalog(monkeypatch, tmp_path):
-    index, files = release()
-    requests = []
-
-    def request(url):
-        requests.append(url)
-        return io.BytesIO(
-            json.dumps(index).encode() if url == data.INDEX_URL else files[url]
-        )
-
-    monkeypatch.setattr(data, "BOON_DATA_DIR", tmp_path)
-    monkeypatch.setattr(data, "_request", request)
-    demo = RecordedResult()
+@pytest.fixture
+def downloaded_query(monkeypatch, tmp_path):
+    upstream = catalog_upstream(monkeypatch, tmp_path)
+    recorded = RecordedResult()
     result = calculate_hero_stats(
-        cast(Demo, demo),
+        cast(Demo, recorded),
         ticks=50,
         steam_ids=[76561197999389679],
         data_version=VERSION,
         explain=True,
     )
-    assert result.values["steam_id"].item() == 76561197999389679
-    assert result.values.schema["steam_id"] == pl.UInt64
-    assert result.values["value"].item() == 36
-    assert result.values.schema["value"] == pl.Float64
-    assert result.metadata["data_version"] == VERSION
-    assert result.contributions.schema["modifier_serial"] == pl.UInt32
-    assert result.contributions.schema["stat"] == pl.String
-    assert demo.calls[0] == (
-        tmp_path / VERSION,
-        [50],
-        {
-            "stats": ["clip_size"],
-            "mode": "current",
-            "steam_ids": [76561197999389679],
-            "heroes": None,
-            "explain": True,
-            "strict": True,
-        },
-    )
-    downloads = len(requests)
-    calculate_hero_stats(cast(Demo, demo), ticks=[50, 60], data_version=VERSION)
-    assert len(requests) == downloads
+    return recorded, result, upstream
+
+
+def test_stat_query_preserves_the_native_value_and_identity(downloaded_query):
+    _, result, _ = downloaded_query
+    assert result.values.select("steam_id", "value").rows() == [
+        (76561197999389679, 36.0)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("table", "expected"),
+    [
+        ("values", {"steam_id": pl.UInt64, "value": pl.Float64}),
+        ("contributions", {"modifier_serial": pl.UInt32, "stat": pl.String}),
+    ],
+)
+def test_stat_query_tables_keep_their_schema(downloaded_query, table, expected):
+    frame = getattr(downloaded_query[1], table)
+    assert {key: frame.schema[key] for key in expected} == expected
+
+
+def test_stat_query_metadata_keeps_the_selected_version(downloaded_query):
+    assert downloaded_query[1].metadata["data_version"] == VERSION
+
+
+def test_stat_query_forwards_selection_and_defaults(downloaded_query, tmp_path):
+    recorded, _, _ = downloaded_query
+    assert recorded.calls == [
+        (
+            tmp_path / VERSION,
+            [50],
+            {
+                "stats": ["clip_size"],
+                "mode": "current",
+                "steam_ids": [76561197999389679],
+                "heroes": None,
+                "explain": True,
+                "strict": True,
+            },
+        )
+    ]
+
+
+def test_stat_query_reuses_verified_catalog_offline(downloaded_query):
+    recorded, _, upstream = downloaded_query
+    before = len(upstream["requests"])
+    upstream["offline"] = True
+    calculate_hero_stats(cast(Demo, recorded), ticks=[50, 60], data_version=VERSION)
+    assert len(upstream["requests"]) == before
 
 
 @pytest.mark.parametrize(
@@ -190,7 +209,14 @@ def test_old_catalog_has_actionable_native_error(demo_paths, tmp_path, monkeypat
     for name in ("heroes", "abilities", "modifiers", "misc"):
         records = [{"hero_id": 1, "hero_name": "Infernus"}] if name == "heroes" else []
         (tmp_path / f"{name}.json").write_text(
-            json.dumps({"catalog": name, "client_version": VERSION, "source_commit": "a" * 40, "records": records})
+            json.dumps(
+                {
+                    "catalog": name,
+                    "client_version": VERSION,
+                    "source_commit": "a" * 40,
+                    "records": records,
+                }
+            )
         )
     monkeypatch.setattr(data, "update", lambda _: tmp_path)
     demo = Demo(str(demo_paths[0]), preload=False)
@@ -198,41 +224,55 @@ def test_old_catalog_has_actionable_native_error(demo_paths, tmp_path, monkeypat
         demo.calculate_hero_stats(ticks=1000, data_version=VERSION)
 
 
-@pytest.mark.parametrize("mode", list(StatMode))
-def test_native_missing_ticks_and_empty_result(demo_paths, tmp_path, monkeypatch, mode):
+@pytest.fixture(scope="module")
+def query_demo(demo_paths):
     if not demo_paths:
         pytest.skip("no demo fixtures")
-    for name in ("heroes", "abilities", "modifiers", "misc"):
-        (tmp_path / f"{name}.json").write_text(
-            json.dumps(
-                {
-                    "catalog": name,
-                    "client_version": VERSION,
-                    "source_commit": "a" * 40,
-                    "records": [],
-                }
-            )
-        )
-    monkeypatch.setattr(data, "update", lambda version: tmp_path)
-    demo = Demo(str(demo_paths[0]), preload=False)
+    return Demo(str(demo_paths[0]), preload=False)
+
+
+@pytest.fixture(scope="module")
+def native_catalog(tmp_path_factory):
+    return write_empty_catalogs(tmp_path_factory.mktemp("hero-query-catalog"), VERSION)
+
+
+@pytest.fixture
+def installed_native_catalog(monkeypatch, native_catalog):
+    monkeypatch.setattr(data, "update", lambda _: native_catalog)
+
+
+def test_native_hero_query_rejects_missing_ticks(query_demo, installed_native_catalog):
     with pytest.raises(CalculationError, match="demo has no tick"):
-        demo.calculate_hero_stats(ticks=2_000_000_000, data_version=VERSION)
-    result = demo.calculate_hero_stats(
-        ticks=1000,
-        mode=mode,
-        heroes=[],
-        data_version=VERSION,
-        stats=list(HeroStat),
+        query_demo.calculate_hero_stats(ticks=2_000_000_000, data_version=VERSION)
+
+
+@pytest.mark.parametrize("mode", list(StatMode))
+@pytest.mark.parametrize(
+    "selection", [{"heroes": []}, {"steam_ids": []}], ids=["no-heroes", "no-accounts"]
+)
+def test_empty_native_hero_query_keeps_schema_and_mode(
+    query_demo, installed_native_catalog, mode, selection
+):
+    result = query_demo.calculate_hero_stats(
+        ticks=1000, mode=mode, data_version=VERSION, stats=list(HeroStat), **selection
+    )
+    assert result.values.is_empty() and result.contributions.is_empty()
+    assert result.values.schema["tick"] == pl.Int32
+    assert (
+        result.values.schema["mode"] == result.contributions.schema["mode"] == pl.String
+    )
+    assert result.metadata["mode"] == mode
+
+
+def test_empty_native_hero_query_reports_the_selected_rules(
+    query_demo, installed_native_catalog
+):
+    result = query_demo.calculate_hero_stats(
+        ticks=1000, heroes=[], data_version=VERSION, stats=list(HeroStat)
     )
     assert {rule["id"] for rule in result.metadata["rulesets"]} == {
         f"{stat.value}.v1" for stat in HeroStat
     }
-    assert result.metadata["mode"] == mode
-    assert result.values.schema["mode"] == pl.String
-    assert result.contributions.schema["mode"] == pl.String
-    assert result.values.is_empty()
-    assert result.values.schema["tick"] == pl.Int32
-    assert result.contributions.is_empty()
 
 
 def test_data_version_cannot_silently_select_latest(monkeypatch):
@@ -311,8 +351,6 @@ def test_partial_values_and_diagnostics_are_retained(monkeypatch, tmp_path, stri
     assert result.values["value"].item() == 36
     assert result.values["status"].item() == "partial"
     assert "123" in result.values["diagnostic"].item()
-    assert demo.calls[0][2]["strict"] is strict
-    assert not demo.calls[0][2]["explain"]
 
 
 @pytest.mark.parametrize(
@@ -342,7 +380,6 @@ def test_native_values_keep_units_precision_and_sign(
     result = calculate_hero_stats(
         cast(Demo, demo), ticks=50, data_version=VERSION, stats=[stat]
     )
-    assert demo.calls[0][2]["stats"] == [stat.value]
     assert result.values.select("stat", "value", "unit", "ruleset").row(0) == (
         stat.value,
         value,
@@ -351,58 +388,69 @@ def test_native_values_keep_units_precision_and_sign(
     )
 
 
-def test_recorded_gravity_does_not_require_hero_or_modifier_definitions(
-    demo_paths, tmp_path, monkeypatch
-):
-    if not demo_paths:
-        pytest.skip("no demo fixtures")
-    for name in ("heroes", "abilities", "modifiers", "misc"):
-        (tmp_path / f"{name}.json").write_text(
-            json.dumps(
-                {
-                    "catalog": name,
-                    "client_version": VERSION,
-                    "source_commit": "a" * 40,
-                    "records": [],
-                }
-            )
+@pytest.fixture(scope="module")
+def recorded_gravity(query_demo, native_catalog):
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(data, "update", lambda _: native_catalog)
+        return query_demo.calculate_hero_stats(
+            ticks=10000,
+            stats=[HeroStat.GRAVITY_SCALE],
+            data_version=VERSION,
+            explain=True,
         )
-    monkeypatch.setattr(data, "update", lambda version: tmp_path)
-    demo = Demo(str(demo_paths[0]), preload=False)
-    result = demo.calculate_hero_stats(
-        ticks=10000,
-        stats=[HeroStat.GRAVITY_SCALE],
-        data_version=VERSION,
-        explain=True,
-    )
-    assert not result.values.is_empty()
-    assert result.values["value"].null_count() == 0
-    assert result.values["diagnostic"].null_count() == result.values.height
-    trace = result.contributions
-    assert trace.height == result.values.height
+
+
+@pytest.fixture(scope="module")
+def selected_gravity(query_demo, native_catalog, recorded_gravity):
+    steam_id = recorded_gravity.values["steam_id"][0]
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(data, "update", lambda _: native_catalog)
+        result = query_demo.calculate_hero_stats(
+            ticks=10000,
+            stats=[HeroStat.GRAVITY_SCALE],
+            data_version=VERSION,
+            steam_ids=[steam_id],
+            explain=True,
+        )
+    return steam_id, result
+
+
+def test_recorded_gravity_needs_no_hero_or_modifier_definitions(recorded_gravity):
+    values = recorded_gravity.values
+    assert not values.is_empty()
+    assert values["value"].null_count() == 0
+    assert values["diagnostic"].null_count() == values.height
+
+
+def test_gravity_contributions_identify_the_recorded_pawn_field(recorded_gravity):
+    values, trace = recorded_gravity.values, recorded_gravity.contributions
+    assert trace.height == values.height
     assert set(trace["source"]) == {"replay/player_pawn"}
     assert set(trace["definition_path"]) == {"m_flGravityScale"}
     assert trace["modifier_serial"].null_count() == trace.height
-    assert result.values.sort("steam_id")["value"].equals(
-        trace.sort("steam_id")["value"]
-    )
+    assert values.sort("steam_id")["value"].equals(trace.sort("steam_id")["value"])
 
-    steam_id = result.values["steam_id"][0]
-    assert steam_id in demo.players["steam_id"]
-    selected = demo.calculate_hero_stats(
-        ticks=10000,
-        stats=[HeroStat.GRAVITY_SCALE],
-        data_version=VERSION,
-        steam_ids=[steam_id],
-        explain=True,
-    )
-    assert selected.values.equals(result.values.filter(pl.col("steam_id") == steam_id))
-    assert selected.contributions.equals(trace.filter(pl.col("steam_id") == steam_id))
-    assert demo.calculate_hero_stats(
-        ticks=10000, data_version=VERSION, steam_ids=[]
-    ).values.is_empty()
+
+def test_recorded_gravity_identity_matches_roster(query_demo, recorded_gravity):
+    assert recorded_gravity.values["steam_id"][0] in query_demo.players["steam_id"]
+
+
+@pytest.mark.parametrize("table", ["values", "contributions"])
+def test_native_hero_steam_selection_matches_filtered_result(
+    recorded_gravity, selected_gravity, table
+):
+    steam_id, selected = selected_gravity
+    expected = getattr(recorded_gravity, table).filter(pl.col("steam_id") == steam_id)
+    assert getattr(selected, table).equals(expected)
+
+
+def test_native_hero_query_rejects_unknown_steam_ids(
+    query_demo, installed_native_catalog
+):
     with pytest.raises(CalculationError, match="Steam ID 1 has no selected hero"):
-        demo.calculate_hero_stats(ticks=10000, data_version=VERSION, steam_ids=[1])
+        query_demo.calculate_hero_stats(
+            ticks=10000, data_version=VERSION, steam_ids=[1]
+        )
 
 
 def test_missing_steam_id_keeps_stat_row(monkeypatch, tmp_path):
@@ -437,3 +485,17 @@ def test_stat_mode_reaches_native_query_and_results(monkeypatch, tmp_path, mode)
     assert demo.calls[0][2]["mode"] == mode
     assert result.values["mode"].item() == mode
     assert result.metadata["mode"] == mode
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_strict_query_flag_reaches_native(monkeypatch, tmp_path, strict):
+    monkeypatch.setattr(data, "update", lambda _: tmp_path)
+    recorded = RecordedResult()
+    calculate_hero_stats(
+        cast(Demo, recorded), ticks=50, data_version=VERSION, strict=strict
+    )
+    options = recorded.calls[0][2]
+    assert {name: options[name] for name in ("strict", "explain")} == {
+        "strict": strict,
+        "explain": False,
+    }

@@ -12,6 +12,7 @@ import polars as pl
 import pytest
 from boon import Demo
 from conftest import _require_demo_fixture
+from polars.testing import assert_frame_equal
 
 SNAPSHOT_DATASETS = ["player_ticks", "world_ticks", "troopers"]
 
@@ -34,23 +35,19 @@ def test_parallel_matches_serial(
     monkeypatch.setenv("BOON_TICK_SEGMENTS", "4")
     parallel = getattr(Demo(demo_path, preload=False), dataset)
 
-    assert serial.shape == parallel.shape
-    assert serial.columns == parallel.columns
-    assert serial.equals(parallel)
+    assert_frame_equal(serial, parallel, check_exact=True)
 
 
-def test_mixed_load_keeps_snapshots_parallel_and_exact(
-    serial_frames: dict[str, pl.DataFrame],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    demo_path = str(_require_demo_fixture())
+@pytest.fixture(scope="module")
+def mixed_frames(name_catalog_cache) -> dict[str, pl.DataFrame]:
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("BOON_TICK_SEGMENTS", "4")
+        patch.setenv("BOON_DATA_DIR", str(name_catalog_cache))
+        parsed = Demo(str(_require_demo_fixture()), preload=False)
+        parsed.load(*SNAPSHOT_DATASETS, "kills")
+    return {name: getattr(parsed, name) for name in (*SNAPSHOT_DATASETS, "kills")}
 
-    # A mixed request must keep the snapshots on their parallel segmented path
-    # while kills uses the filtered event/entity pass.
-    monkeypatch.setenv("BOON_TICK_SEGMENTS", "4")
-    mixed = Demo(demo_path, preload=False)
-    mixed.load(*SNAPSHOT_DATASETS, "kills")
 
-    for ds in SNAPSHOT_DATASETS:
-        assert serial_frames[ds].equals(getattr(mixed, ds)), ds
-    assert serial_frames["kills"].equals(mixed.kills)
+@pytest.mark.parametrize("dataset", [*SNAPSHOT_DATASETS, "kills"])
+def test_mixed_load_matches_serial(serial_frames, mixed_frames, dataset):
+    assert_frame_equal(serial_frames[dataset], mixed_frames[dataset], check_exact=True)

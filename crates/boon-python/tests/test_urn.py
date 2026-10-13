@@ -5,8 +5,7 @@ from boon import Demo
 from conftest import _require_demo_fixture
 
 
-def test_urn_tracks_carrier_and_completed_deliveries(demo: Demo) -> None:
-    """Compare Urn events with carrier, channel, and trigger records in 108575009."""
+def test_urn_pickup_ticks(demo: Demo) -> None:
     events = demo.urn
     assert events.filter(pl.col("event") == "picked_up")["tick"].to_list() == [
         42869,
@@ -18,6 +17,10 @@ def test_urn_tracks_carrier_and_completed_deliveries(demo: Demo) -> None:
         137871,
         160816,
     ]
+
+
+def test_urn_completed_delivery_ticks(demo: Demo) -> None:
+    events = demo.urn
     assert events.filter(pl.col("event") == "returned")["tick"].to_list() == [
         46108,
         65839,
@@ -26,12 +29,22 @@ def test_urn_tracks_carrier_and_completed_deliveries(demo: Demo) -> None:
         121939,
         139839,
     ]
+
+
+def test_urn_drop_ticks(demo: Demo) -> None:
+    events = demo.urn
     assert events.filter(pl.col("event") == "dropped")["tick"].to_list() == [
         101280,
         166576,
     ]
-    # Non-carriers enter the return area here; neither completes a delivery.
+
+
+def test_non_carriers_cannot_complete_urn_deliveries(demo: Demo) -> None:
+    events = demo.urn
     assert events.filter(pl.col("tick").is_in([42948, 182712])).is_empty()
-    # Loading Urn alone must use the same clock, source classes, and lifetimes.
+
+
+def test_urn_only_parse_matches_grouped_load(demo: Demo) -> None:
+    events = demo.urn
     standalone = Demo(str(_require_demo_fixture()), preload=False)
     assert standalone.urn.equals(events)

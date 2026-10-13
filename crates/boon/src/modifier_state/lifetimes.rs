@@ -209,80 +209,115 @@ fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn source_expiry_requires_observation_and_matching_full_handle_deletion() {
-        fn entity(serial: u32) -> crate::Entity {
-            crate::Entity::from_fields(2, serial, 1, "Ability", true, Default::default()).unwrap()
-        }
-        let first = ModifierApplication::from(&CModifierTableEntry {
-            last_applied_time: Some(10.0),
+
+    const SOURCE_HANDLE: u32 = (9 << 14) | 2;
+
+    fn application(time: f32) -> ModifierApplication {
+        ModifierApplication::from(&CModifierTableEntry {
+            last_applied_time: Some(time),
             ..Default::default()
-        });
-        let refreshed = ModifierApplication::from(&CModifierTableEntry {
-            last_applied_time: Some(20.0),
-            ..Default::default()
-        });
-        let handle = (9 << 14) | 2;
-        let mut observed = HashMap::new();
+        })
+    }
+
+    fn source(serial: u32) -> crate::Entity {
+        crate::Entity::from_fields(2, serial, 1, "Ability", true, Default::default()).unwrap()
+    }
+
+    fn deleted_source(serial: u32) -> crate::EntityContainer {
         let mut entities = crate::EntityContainer::new();
-        entities.insert(entity(9)).unwrap();
+        entities.insert(source(serial)).unwrap();
+        entities.clear_entity_changes();
+        entities.insert(source(10)).unwrap();
+        entities
+    }
+
+    fn observed_source() -> HashMap<u32, (ModifierApplication, u32)> {
+        HashMap::from([(1, (application(10.0), SOURCE_HANDLE))])
+    }
+
+    #[test]
+    fn observing_a_source_records_its_full_handle_without_expiry() {
+        let mut entities = crate::EntityContainer::new();
+        entities.insert(source(9)).unwrap();
+        let mut observed = HashMap::new();
         assert!(!observe_ability(
             &mut observed,
             1,
-            first,
-            Some(handle),
+            application(10.0),
+            Some(SOURCE_HANDLE),
             &entities
         ));
-        let missing = crate::EntityContainer::new();
+        assert_eq!(observed, observed_source());
+    }
+
+    #[test]
+    fn missing_source_evidence_does_not_expire_an_application() {
+        for handle in [None, Some(SOURCE_HANDLE)] {
+            let mut observed = observed_source();
+            assert!(!observe_ability(
+                &mut observed,
+                1,
+                application(10.0),
+                handle,
+                &crate::EntityContainer::new()
+            ));
+            assert_eq!(observed, observed_source());
+        }
+    }
+
+    #[test]
+    fn deletion_of_another_source_serial_does_not_expire_an_application() {
+        let mut observed = observed_source();
         assert!(!observe_ability(
             &mut observed,
             1,
-            first,
-            Some(handle),
-            &missing
+            application(10.0),
+            Some(SOURCE_HANDLE),
+            &deleted_source(8)
         ));
-        // Deleting another serial in the same slot is not evidence.
-        let mut other = crate::EntityContainer::new();
-        other.insert(entity(8)).unwrap();
-        other.insert(entity(10)).unwrap();
-        assert!(!observe_ability(
-            &mut observed,
-            1,
-            first,
-            Some(handle),
-            &other
-        ));
-        entities.clear_entity_changes();
-        entities.insert(entity(10)).unwrap();
+    }
+
+    #[test]
+    fn matching_source_deletion_can_expire_an_observed_application_only_once() {
+        let mut observed = observed_source();
+        let entities = deleted_source(9);
         assert!(observe_ability(
             &mut observed,
             1,
-            first,
-            Some(handle),
+            application(10.0),
+            Some(SOURCE_HANDLE),
             &entities
         ));
         assert!(!observe_ability(
             &mut observed,
             1,
-            first,
-            Some(handle),
+            application(10.0),
+            Some(SOURCE_HANDLE),
             &entities
         ));
+    }
+
+    #[test]
+    fn another_modifier_cannot_reuse_a_source_observation() {
+        let mut observed = observed_source();
         assert!(!observe_ability(
             &mut observed,
             2,
-            first,
-            Some(handle),
-            &entities
+            application(10.0),
+            Some(SOURCE_HANDLE),
+            &deleted_source(9)
         ));
-        // A new application must supply its own observation.
-        observed.insert(1, (first, handle));
+    }
+
+    #[test]
+    fn reapplication_requires_a_new_source_observation() {
+        let mut observed = observed_source();
         assert!(!observe_ability(
             &mut observed,
             1,
-            refreshed,
-            Some(handle),
-            &entities
+            application(20.0),
+            Some(SOURCE_HANDLE),
+            &deleted_source(9)
         ));
     }
 
@@ -329,22 +364,39 @@ mod tests {
     }
 
     #[test]
-    fn expiry_needs_observed_states_and_tracks_each_application_separately() {
-        let first = ModifierApplication::from(&CModifierTableEntry {
-            last_applied_time: Some(10.0),
-            ..Default::default()
-        });
-        let refreshed = ModifierApplication::from(&CModifierTableEntry {
-            last_applied_time: Some(20.0),
-            ..Default::default()
-        });
+    fn absent_states_cannot_expire_an_unobserved_application() {
+        assert!(!observe(
+            &mut HashMap::new(),
+            1,
+            application(10.0),
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn present_states_record_the_application_without_expiry() {
         let mut observed = HashMap::new();
-        assert!(!observe(&mut observed, 1, first, Some(false)));
-        assert!(!observe(&mut observed, 1, first, Some(true)));
-        assert!(!observe(&mut observed, 2, first, Some(true)));
-        assert!(!observe(&mut observed, 1, first, None));
-        assert!(observe(&mut observed, 1, first, Some(false)));
-        assert!(observed.contains_key(&2));
-        assert!(!observe(&mut observed, 2, refreshed, Some(false)));
+        assert!(!observe(&mut observed, 1, application(10.0), Some(true)));
+        assert_eq!(observed.get(&1), Some(&application(10.0)));
+    }
+
+    #[test]
+    fn missing_states_preserve_a_previous_observation() {
+        let mut observed = HashMap::from([(1, application(10.0))]);
+        assert!(!observe(&mut observed, 1, application(10.0), None));
+        assert!(observed.contains_key(&1));
+    }
+
+    #[test]
+    fn state_expiry_does_not_clear_another_modifier() {
+        let mut observed = HashMap::from([(1, application(10.0)), (2, application(10.0))]);
+        assert!(observe(&mut observed, 1, application(10.0), Some(false)));
+        assert_eq!(observed, HashMap::from([(2, application(10.0))]));
+    }
+
+    #[test]
+    fn reapplication_cannot_expire_from_old_state_evidence() {
+        let mut observed = HashMap::from([(1, application(10.0))]);
+        assert!(!observe(&mut observed, 1, application(20.0), Some(false)));
     }
 }

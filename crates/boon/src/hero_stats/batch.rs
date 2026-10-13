@@ -163,53 +163,90 @@ mod tests {
     }
 
     #[test]
-    fn batch_validates_queries_before_decoding() {
+    fn batch_requires_at_least_one_query() {
         invalid(&StatBatch::new(), "at least one stat query");
+    }
+
+    #[test]
+    fn hero_query_requires_a_selected_ruleset() {
         let hero = HeroStatQuery::new([1], [HeroStat::ClipSize]);
-        let hero_rules = Ruleset::new().with(HeroStat::ClipSize.rule());
-        let ability = AbilityStatQuery::new([1], [AbilityStat::RangeBonus]);
-        let ability_rules = AbilityRuleset::new().with(AbilityStat::RangeBonus.rule());
         invalid(
             &StatBatch::new().hero_stats(&hero, &Ruleset::new()),
             "select clip_size",
         );
+    }
+
+    #[test]
+    fn ability_query_requires_a_selected_ruleset() {
+        let ability = AbilityStatQuery::new([1], [AbilityStat::RangeBonus]);
         invalid(
             &StatBatch::new().ability_stats(&ability, &AbilityRuleset::new()),
             "select range_bonus",
         );
+    }
+
+    #[test]
+    fn imbue_query_rejects_empty_or_negative_ticks() {
+        let hero = HeroStatQuery::new([1], [HeroStat::ClipSize]);
+        let rules = Ruleset::new().with(HeroStat::ClipSize.rule());
         for ticks in [vec![], vec![-1], vec![1, -1]] {
-            let imbues = ImbueQuery::new(ticks.clone());
             invalid(
                 &StatBatch::new()
-                    .hero_stats(&hero, &hero_rules)
-                    .imbues(&imbues),
-                "nonnegative ticks",
-            );
-            let hero = HeroStatQuery::new(ticks.clone(), [HeroStat::ClipSize]);
-            invalid(
-                &StatBatch::new()
-                    .hero_stats(&hero, &hero_rules)
-                    .ability_stats(&ability, &ability_rules),
-                "nonnegative ticks",
-            );
-            let ability = AbilityStatQuery::new(ticks, [AbilityStat::RangeBonus]);
-            invalid(
-                &StatBatch::new().ability_stats(&ability, &ability_rules),
+                    .hero_stats(&hero, &rules)
+                    .imbues(&ImbueQuery::new(ticks)),
                 "nonnegative ticks",
             );
         }
+    }
+
+    #[test]
+    fn hero_query_rejects_empty_or_negative_ticks() {
+        let rules = Ruleset::new().with(HeroStat::ClipSize.rule());
+        let ability = AbilityStatQuery::new([1], [AbilityStat::RangeBonus]);
+        let ability_rules = AbilityRuleset::new().with(AbilityStat::RangeBonus.rule());
+        for ticks in [vec![], vec![-1], vec![1, -1]] {
+            invalid(
+                &StatBatch::new()
+                    .hero_stats(&HeroStatQuery::new(ticks, [HeroStat::ClipSize]), &rules)
+                    .ability_stats(&ability, &ability_rules),
+                "nonnegative ticks",
+            );
+        }
+    }
+
+    #[test]
+    fn ability_query_rejects_empty_or_negative_ticks() {
+        let rules = AbilityRuleset::new().with(AbilityStat::RangeBonus.rule());
+        for ticks in [vec![], vec![-1], vec![1, -1]] {
+            invalid(
+                &StatBatch::new().ability_stats(
+                    &AbilityStatQuery::new(ticks, [AbilityStat::RangeBonus]),
+                    &rules,
+                ),
+                "nonnegative ticks",
+            );
+        }
+    }
+
+    #[test]
+    fn hero_query_requires_at_least_one_stat() {
+        let rules = Ruleset::new().with(HeroStat::ClipSize.rule());
         invalid(
-            &StatBatch::new().hero_stats(&HeroStatQuery::new([1], []), &hero_rules),
+            &StatBatch::new().hero_stats(&HeroStatQuery::new([1], []), &rules),
             "at least one stat",
-        );
-        invalid(
-            &StatBatch::new().ability_stats(&AbilityStatQuery::new([1], []), &ability_rules),
-            "at least one ability stat",
         );
     }
 
     #[test]
-    fn batch_runs_optional_queries_and_propagates_replay_errors() {
+    fn ability_query_requires_at_least_one_stat() {
+        let rules = AbilityRuleset::new().with(AbilityStat::RangeBonus.rule());
+        invalid(
+            &StatBatch::new().ability_stats(&AbilityStatQuery::new([1], []), &rules),
+            "at least one ability stat",
+        );
+    }
+
+    fn batch_parser() -> Parser {
         use boon_proto::proto::{CDemoFullPacket, CDemoSendTables, EDemoCommands};
         use prost::Message;
         let mut bytes = b"PBDEMS2\0".to_vec();
@@ -242,9 +279,71 @@ mod tests {
             }
             bytes.extend(body);
         }
-        let parser = Parser::from_bytes(bytes);
+        Parser::from_bytes(bytes)
+    }
+
+    fn batch_catalog() -> StatCatalog {
         let folder = super::super::catalog::tests::fixture();
-        let catalog = StatCatalog::from_directory(folder.path()).unwrap();
+        StatCatalog::from_directory(folder.path()).unwrap()
+    }
+
+    #[test]
+    fn batch_keeps_unrequested_results_absent() {
+        let result = batch_parser()
+            .calculate_stats(
+                &StatBatch::new().imbues(&ImbueQuery::new([10])),
+                &batch_catalog(),
+            )
+            .unwrap();
+        assert!(result.hero_stats.is_none() && result.ability_stats.is_none());
+        assert!(result.imbues.is_some());
+    }
+
+    #[test]
+    fn batch_queries_return_empty_rows_when_no_players_exist() {
+        let hero = HeroStatQuery::new([20, 10, 20], [HeroStat::ClipSize]);
+        let rules = Ruleset::new().with(HeroStat::ClipSize.rule());
+        let result = batch_parser()
+            .calculate_stats(
+                &StatBatch::new()
+                    .hero_stats(&hero, &rules)
+                    .imbues(&ImbueQuery::new([10])),
+                &batch_catalog(),
+            )
+            .unwrap();
+        assert!(result.hero_stats.unwrap().values.is_empty());
+        assert!(result.imbues.unwrap().bindings.is_empty());
+    }
+
+    #[test]
+    fn batch_preserves_the_ability_query_mode() {
+        let ability = AbilityStatQuery::new([20], [AbilityStat::RangeBonus])
+            .mode(super::super::StatMode::Baseline);
+        let rules = AbilityRuleset::new().with(AbilityStat::RangeBonus.rule());
+        let result = batch_parser()
+            .calculate_stats(
+                &StatBatch::new().ability_stats(&ability, &rules),
+                &batch_catalog(),
+            )
+            .unwrap();
+        assert_eq!(
+            result.ability_stats.unwrap().metadata.mode,
+            Some(super::super::StatMode::Baseline)
+        );
+    }
+
+    #[test]
+    fn prepared_stat_replay_uses_the_requested_segment_count() {
+        let replay = batch_parser()
+            .prepare_stat_replay(&batch_catalog(), 2)
+            .unwrap();
+        assert_eq!(replay.len(), 2);
+    }
+
+    #[test]
+    fn prepared_stat_replay_matches_a_fresh_batch() {
+        let parser = batch_parser();
+        let catalog = batch_catalog();
         let hero = HeroStatQuery::new([20, 10, 20], [HeroStat::ClipSize]);
         let hero_rules = Ruleset::new().with(HeroStat::ClipSize.rule());
         let ability = AbilityStatQuery::new([20], [AbilityStat::RangeBonus])
@@ -255,15 +354,7 @@ mod tests {
             .hero_stats(&hero, &hero_rules)
             .ability_stats(&ability, &ability_rules)
             .imbues(&imbues);
-        let result = parser.calculate_stats(&batch, &catalog).unwrap();
-        assert!(result.hero_stats.unwrap().values.is_empty());
-        assert_eq!(
-            result.ability_stats.unwrap().metadata.mode,
-            Some(super::super::StatMode::Baseline)
-        );
-        assert!(result.imbues.unwrap().bindings.is_empty());
         let replay = parser.prepare_stat_replay(&catalog, 2).unwrap();
-        assert_eq!(replay.len(), 2);
         let fresh = parser.calculate_stats(&batch, &catalog).unwrap();
         let cached = parser
             .calculate_stats_with_replay(&batch, &catalog, &replay)
@@ -272,40 +363,81 @@ mod tests {
             serde_json::to_value(fresh).unwrap(),
             serde_json::to_value(cached).unwrap()
         );
-        let other_catalog = StatCatalog::from_directory(folder.path()).unwrap();
+    }
+
+    #[test]
+    fn prepared_stat_replay_rejects_a_different_catalog() {
+        let parser = batch_parser();
+        let catalog = batch_catalog();
+        let replay = parser.prepare_stat_replay(&catalog, 2).unwrap();
         assert!(
             parser
-                .calculate_stats_with_replay(&batch, &other_catalog, &replay)
+                .calculate_stats_with_replay(
+                    &StatBatch::new().imbues(&ImbueQuery::new([10])),
+                    &batch_catalog(),
+                    &replay
+                )
                 .is_err()
         );
-        assert!(parser.prepare_stat_replay(&catalog, 0).is_err());
+    }
+
+    #[test]
+    fn prepared_stat_replay_rejects_zero_segments() {
+        assert!(
+            batch_parser()
+                .prepare_stat_replay(&batch_catalog(), 0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn prepared_stat_replay_rejects_a_different_demo() {
+        let parser = batch_parser();
+        let catalog = batch_catalog();
+        let replay = parser.prepare_stat_replay(&catalog, 2).unwrap();
         assert!(
             Parser::from_bytes(Vec::new())
-                .calculate_stats_with_replay(&batch, &catalog, &replay)
+                .calculate_stats_with_replay(
+                    &StatBatch::new().imbues(&ImbueQuery::new([10])),
+                    &catalog,
+                    &replay
+                )
                 .is_err()
         );
-        let result = parser
-            .calculate_stats(&StatBatch::new().imbues(&imbues), &catalog)
-            .unwrap();
-        assert!(result.hero_stats.is_none() && result.ability_stats.is_none());
-        assert!(result.imbues.is_some());
-        let error = parser
-            .calculate_stats(&StatBatch::new().imbues(&ImbueQuery::new([19])), &catalog)
+    }
+
+    #[test]
+    fn batch_rejects_a_missing_tick() {
+        let error = batch_parser()
+            .calculate_stats(
+                &StatBatch::new().imbues(&ImbueQuery::new([19])),
+                &batch_catalog(),
+            )
             .unwrap_err();
         assert!(error.to_string().contains("demo has no tick 19"));
-        let missing = AbilityStatQuery::new([20], [AbilityStat::RangeBonus]).abilities([123]);
-        let error = parser
+    }
+
+    #[test]
+    fn batch_rejects_an_unowned_ability() {
+        let ability = AbilityStatQuery::new([20], [AbilityStat::RangeBonus]).abilities([123]);
+        let rules = AbilityRuleset::new().with(AbilityStat::RangeBonus.rule());
+        let error = batch_parser()
             .calculate_stats(
-                &StatBatch::new().ability_stats(&missing, &ability_rules),
-                &catalog,
+                &StatBatch::new().ability_stats(&ability, &rules),
+                &batch_catalog(),
             )
             .unwrap_err();
         assert!(error.to_string().contains("not owned"));
-        let missing = HeroStatQuery::new([20], [HeroStat::ClipSize]).steam_ids([1]);
-        let error = parser
+    }
+
+    #[test]
+    fn batch_rejects_an_unselected_steam_account() {
+        let hero = HeroStatQuery::new([20], [HeroStat::ClipSize]).steam_ids([1]);
+        let rules = Ruleset::new().with(HeroStat::ClipSize.rule());
+        let error = batch_parser()
             .calculate_stats(
-                &StatBatch::new().hero_stats(&missing, &hero_rules),
-                &catalog,
+                &StatBatch::new().hero_stats(&hero, &rules),
+                &batch_catalog(),
             )
             .unwrap_err();
         assert!(

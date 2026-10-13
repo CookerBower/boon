@@ -7,15 +7,22 @@ from boon import Demo
 from polars.testing import assert_frame_equal
 
 
-def test_default_preload_matches_grouped_lazy_load(demo_paths: list[Path]) -> None:
+@pytest.fixture(scope="module")
+def loading_modes(demo_paths: list[Path]):
     if not demo_paths:
         pytest.skip("No demo fixtures available")
+    pairs = []
     for path in demo_paths:
         eager = Demo(str(path))
         lazy = Demo(str(path), preload=False)
-        assert eager.match_id == lazy.match_id
         lazy.load("kills", "damage", "abilities")
-        for dataset in ("kills", "damage", "abilities"):
-            assert_frame_equal(getattr(eager, dataset), getattr(lazy, dataset))
-        eager.load("kills", "damage", "abilities")
-        assert_frame_equal(eager.damage, lazy.damage)
+        pairs.append((eager, lazy))
+    return pairs
+
+
+@pytest.mark.parametrize("dataset", ["kills", "damage", "abilities"])
+def test_default_preload_matches_grouped_lazy_load(loading_modes, dataset):
+    for eager, lazy in loading_modes:
+        assert_frame_equal(
+            getattr(eager, dataset), getattr(lazy, dataset), check_exact=True
+        )

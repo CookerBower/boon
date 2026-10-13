@@ -1,9 +1,7 @@
 """JSON catalog acquisition, integrity checks, and offline CLI behavior."""
 
 import copy
-import io
 import json
-import urllib.error
 from pathlib import Path
 
 import pytest
@@ -15,6 +13,7 @@ from catalog_helpers import (
     VERSION,
     VERSION_DATE,
     VERSION_TIME,
+    catalog_upstream,
     fingerprint,
     release,
 )
@@ -23,22 +22,7 @@ from typer.testing import CliRunner
 
 @pytest.fixture
 def upstream(monkeypatch, tmp_path):
-    monkeypatch.setattr(data, "BOON_DATA_DIR", tmp_path / "cache")
-    index, files = release()
-    state: dict = {"index": index, "files": files, "requests": [], "offline": False}
-
-    def request(url):
-        state["requests"].append(url)
-        if state["offline"]:
-            raise urllib.error.URLError("offline")
-        if url == data.INDEX_URL:
-            content = json.dumps(state["index"]).encode()
-        else:
-            content = state["files"][url]
-        return io.BytesIO(content)
-
-    monkeypatch.setattr(data, "_request", request)
-    return state
+    return catalog_upstream(monkeypatch, tmp_path / "cache")
 
 
 def replace_manifest(upstream, manifest):
@@ -52,25 +36,52 @@ def replace_manifest(upstream, manifest):
         upstream["files"][metadata["url"]] = content
 
 
-def test_downloads_all_json_files_and_reuses_them_offline(upstream):
+@pytest.fixture
+def installed_version(upstream):
+    return data.update(VERSION)
+
+
+def test_download_installs_the_complete_json_release(upstream):
     directory = data.update()
     assert directory == data.BOON_DATA_DIR / VERSION
     assert data.available_files(VERSION) == sorted(FILES)
+    assert {path.name for path in directory.iterdir()} == FILES | {".install.json"}
     for name in FILES:
         assert (directory / name).read_bytes() == upstream["files"][
             f"{data._DOWNLOAD_URL}/{VERSION}/{name}"
         ]
+
+
+def test_manifest_retains_the_source_client_version(installed_version):
     assert data.manifest(VERSION)["client_version"] == VERSION
-    assert not list(directory.glob("*.zip"))
-    assert not list(directory.glob("*.vdata"))
+
+
+def test_explicit_get_reuses_the_installed_version_offline(upstream, installed_version):
     upstream["offline"] = True
     before = len(upstream["requests"])
-    assert data.update(VERSION) == directory
-    assert data.catalog_path("abilities") == directory / "abilities.json"
-    assert data.catalog_path("heroes.json", VERSION) == directory / "heroes.json"
-    assert data.catalog_path("misc", VERSION) == directory / "misc.json"
-    assert data.local_versions()[0]["released_at"] == PUBLISHED
+    assert data.update(VERSION) == installed_version
     assert len(upstream["requests"]) == before
+
+
+@pytest.mark.parametrize(
+    ("name", "version", "filename"),
+    [
+        ("abilities", None, "abilities.json"),
+        ("heroes.json", VERSION, "heroes.json"),
+        ("misc", VERSION, "misc.json"),
+    ],
+)
+def test_catalog_path_resolves_installed_json_offline(
+    upstream, installed_version, name, version, filename
+):
+    upstream["offline"] = True
+    before = len(upstream["requests"])
+    assert data.catalog_path(name, version) == installed_version / filename
+    assert len(upstream["requests"]) == before
+
+
+def test_local_receipt_keeps_the_release_timestamp(installed_version):
+    assert data.local_versions()[0]["released_at"] == PUBLISHED
 
 
 def test_default_get_uses_latest_index_version_not_newest_local(upstream):
@@ -105,10 +116,12 @@ def test_shared_snapshot_is_installed_under_requested_client_version(upstream):
         "latest",
     ],
 )
-def test_invalid_client_version_is_rejected_before_network(upstream, version):
-    for operation in (data.update, data.remove):
-        with pytest.raises(data.DataError, match="numeric client version"):
-            operation(version)
+@pytest.mark.parametrize("operation", [data.update, data.remove])
+def test_invalid_client_version_is_rejected_before_network(
+    upstream, version, operation
+):
+    with pytest.raises(data.DataError, match="numeric client version"):
+        operation(version)
     assert not upstream["requests"]
 
 
@@ -149,23 +162,33 @@ def test_failed_force_download_preserves_existing_installation(upstream, damage)
     assert sorted(p.name for p in data.BOON_DATA_DIR.iterdir()) == [VERSION]
 
 
-def test_force_repairs_same_size_corruption_and_status_requires_valid_checksums(
-    upstream,
-):
-    directory = data.update(VERSION)
-    path = directory / "abilities.json"
+@pytest.fixture
+def corrupt_installation(installed_version):
+    path = installed_version / "abilities.json"
     path.write_bytes(b"x" * path.stat().st_size)
+    return installed_version
+
+
+def test_corrupt_installation_is_not_listed_as_local(corrupt_installation):
     assert data.local_versions() == []
+
+
+def test_reusing_corrupt_installation_requires_force(corrupt_installation):
     with pytest.raises(data.DataError, match="--force"):
         data.update(VERSION)
+
+
+def test_versions_cli_marks_corrupt_installation_as_not_installed(corrupt_installation):
     result = CliRunner().invoke(app, ["versions", "--json"])
     assert json.loads(result.stdout)["versions"][0]["installed"] is False
+
+
+def test_force_repairs_same_size_corruption(upstream, corrupt_installation):
     data.update(VERSION, force=True)
     assert len(data.local_versions()) == 1
-    assert (
-        path.read_bytes()
-        == upstream["files"][f"{data._DOWNLOAD_URL}/{VERSION}/abilities.json"]
-    )
+    assert (corrupt_installation / "abilities.json").read_bytes() == upstream["files"][
+        f"{data._DOWNLOAD_URL}/{VERSION}/abilities.json"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -258,11 +281,9 @@ def test_force_install_rolls_back_on_rename_failure(upstream, monkeypatch):
     assert len(data.local_versions()) == 1
 
 
-def test_cli_get_and_versions_show_build_date_time_and_installation(upstream):
-    runner = CliRunner()
-    result = runner.invoke(app, ["versions", "--json"])
-    row = json.loads(result.stdout)["versions"][0]
-    assert row == {
+def test_versions_json_reports_build_time_before_installation(upstream):
+    result = CliRunner().invoke(app, ["versions", "--json"])
+    assert json.loads(result.stdout)["versions"][0] == {
         "client_version": VERSION,
         "released_at": PUBLISHED,
         "version_date": VERSION_DATE,
@@ -270,47 +291,64 @@ def test_cli_get_and_versions_show_build_date_time_and_installation(upstream):
         "installed": False,
         "path": None,
     }
-    result = runner.invoke(app, ["get", VERSION, "--json"])
+
+
+def test_get_json_reports_downloaded_artifacts(upstream):
+    result = CliRunner().invoke(app, ["get", VERSION, "--json"])
     assert result.exit_code == 0, result.output
-    downloaded = json.loads(result.stdout)
-    assert downloaded["client_version"] == VERSION
-    assert set(downloaded["files"]) == FILES
-    result = runner.invoke(app, ["versions", "--json"])
+    payload = json.loads(result.stdout)
+    assert payload["client_version"] == VERSION
+    assert set(payload["files"]) == FILES
+
+
+def test_versions_json_reports_the_installed_path(installed_version):
+    result = CliRunner().invoke(app, ["versions", "--json"])
     assert result.exit_code == 0, result.output
     row = json.loads(result.stdout)["versions"][0]
     assert row["installed"] is True
-    assert row["path"] == downloaded["path"]
-    result = runner.invoke(app, ["versions"])
-    assert (
-        VERSION in result.stdout
-        and VERSION_DATE in result.stdout
-        and VERSION_TIME in result.stdout
-        and "yes" in result.stdout
+    assert row["path"] == str(installed_version)
+
+
+def test_versions_text_shows_build_time_and_installation(installed_version):
+    result = CliRunner().invoke(app, ["versions"])
+    assert all(
+        text in result.stdout for text in [VERSION, VERSION_DATE, VERSION_TIME, "yes"]
     )
     assert "Released at" not in result.stdout and PUBLISHED not in result.stdout
 
 
-def test_offline_versions_and_explicit_get_use_local_receipt(upstream):
-    data.update(VERSION)
+def test_versions_falls_back_to_local_receipt_when_offline(upstream, installed_version):
     upstream["offline"] = True
-    runner = CliRunner()
-    result = runner.invoke(app, ["versions"])
+    result = CliRunner().invoke(app, ["versions"])
     assert result.exit_code == 0, result.output
-    assert VERSION in result.stdout
+    assert all(text in result.stdout for text in [VERSION, VERSION_DATE, VERSION_TIME])
     assert "Released at" not in result.stdout and PUBLISHED not in result.stdout
-    assert VERSION_DATE in result.stdout and VERSION_TIME in result.stdout
     assert "could not list" in result.output
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["versions", "--local"], ["get", VERSION]],
+    ids=["local-versions", "explicit-get"],
+)
+def test_explicit_local_commands_do_not_use_network(upstream, installed_version, args):
+    upstream["offline"] = True
     before = len(upstream["requests"])
-    for args in (["versions", "--local"], ["get", VERSION]):
-        result = runner.invoke(app, args)
-        assert result.exit_code == 0, result.output
-        if args[0] == "versions":
-            assert VERSION_DATE in result.stdout and VERSION_TIME in result.stdout
-            assert "Released at" not in result.stdout and PUBLISHED not in result.stdout
-        else:
-            assert "5 JSON files" in result.stdout
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
     assert len(upstream["requests"]) == before
-    result = runner.invoke(app, ["get"])
+    if args[0] == "versions":
+        assert VERSION_DATE in result.stdout and VERSION_TIME in result.stdout
+        assert "Released at" not in result.stdout and PUBLISHED not in result.stdout
+    else:
+        assert "5 JSON files" in result.stdout
+
+
+def test_default_get_fails_when_the_remote_index_is_offline(
+    upstream, installed_version
+):
+    upstream["offline"] = True
+    result = CliRunner().invoke(app, ["get"])
     assert result.exit_code == 1
     assert "error:" in result.output
 
@@ -342,7 +380,8 @@ def test_permission_error_listing_cache_is_reported(upstream, monkeypatch):
     assert "could not list the boon-data cache" in result.output
 
 
-def test_remove_is_offline_and_preserves_other_versions(upstream):
+@pytest.fixture
+def removed_version(upstream):
     directory = data.update(VERSION)
     upstream["index"], upstream["files"] = release("6699")
     other = data.update("6699")
@@ -351,29 +390,56 @@ def test_remove_is_offline_and_preserves_other_versions(upstream):
     before = len(upstream["requests"])
     result = CliRunner().invoke(app, ["remove", VERSION, "--json"])
     assert result.exit_code == 0, result.output
+    return directory, other, original, result, before
+
+
+def test_remove_cli_reports_the_removed_version(removed_version):
+    directory, _, _, result, _ = removed_version
     assert json.loads(result.stdout) == {
         "client_version": VERSION,
         "path": str(directory),
         "removed": True,
     }
+
+
+def test_remove_deletes_only_the_selected_directory(removed_version):
+    directory, _, _, _, _ = removed_version
     assert not directory.exists()
     assert data.BOON_DATA_DIR.is_dir()
+
+
+def test_remove_preserves_other_installed_versions(removed_version):
+    _, other, original, _, _ = removed_version
     assert {p.name: p.read_bytes() for p in other.iterdir()} == original
     assert [entry["client_version"] for entry in data.local_versions()] == ["6699"]
+
+
+def test_remove_needs_no_network_requests(removed_version, upstream):
+    _, _, _, _, before = removed_version
     assert len(upstream["requests"]) == before
 
 
-def test_remove_corrupt_installation_and_get_it_again(upstream):
+@pytest.fixture
+def removed_corrupt_version(upstream):
     directory = data.update(VERSION)
     (directory / "heroes.json").unlink()
     (directory / ".install.json").write_text("invalid")
     upstream["offline"] = True
-    runner = CliRunner()
-    removed = runner.invoke(app, ["remove", VERSION])
+    removed = CliRunner().invoke(app, ["remove", VERSION])
+    return directory, removed
+
+
+def test_remove_accepts_a_corrupt_installation(removed_corrupt_version):
+    directory, removed = removed_corrupt_version
     assert removed.exit_code == 0 and f"Removed {VERSION}" in removed.stdout
     assert not directory.exists()
+
+
+def test_get_reinstalls_a_removed_corrupt_version(removed_corrupt_version, upstream):
+    directory, removed = removed_corrupt_version
+    assert removed.exit_code == 0, removed.output
     upstream["offline"] = False
-    downloaded = runner.invoke(app, ["get", VERSION])
+    downloaded = CliRunner().invoke(app, ["get", VERSION])
     assert downloaded.exit_code == 0, downloaded.output
     assert "5 JSON files" in downloaded.stdout
     assert (directory / "misc.json").is_file()
@@ -398,20 +464,29 @@ def test_remove_requires_an_explicit_version(upstream):
     assert not upstream["requests"]
 
 
-def test_remove_rejects_symlinked_version_and_does_not_follow_nested_links(
-    upstream, tmp_path
-):
+@pytest.fixture
+def external_marker(tmp_path):
     target = tmp_path / "external"
     target.mkdir()
     marker = target / "keep.txt"
     marker.write_text("keep")
     data.BOON_DATA_DIR.mkdir()
+    return target, marker
+
+
+def test_remove_rejects_a_symlinked_version(upstream, external_marker):
+    target, marker = external_marker
     path = data.BOON_DATA_DIR / VERSION
     path.symlink_to(target, target_is_directory=True)
     with pytest.raises(data.DataError, match="symlink"):
         data.remove(VERSION)
     assert path.is_symlink() and marker.read_text() == "keep"
-    path.unlink()
+    assert not upstream["requests"]
+
+
+def test_remove_does_not_follow_nested_symlinks(upstream, external_marker):
+    target, marker = external_marker
+    path = data.BOON_DATA_DIR / VERSION
     path.mkdir()
     (path / "nested-link").symlink_to(target, target_is_directory=True)
     data.remove(VERSION)

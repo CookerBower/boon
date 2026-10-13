@@ -102,41 +102,84 @@ class AmmoDemo:
         )
 
 
-def test_rounds_capacity_and_unlimited_state_keep_identity_and_uncertainty():
+@pytest.fixture
+def reconstructed_ammo():
     demo = AmmoDemo()
     frames = snapshots(
         cast(Demo, demo), ["player_ticks", "world_ticks"], ticks=7, data_version="1234"
     )
-    assert isinstance(frames, dict)
+    return demo, frames
+
+
+@pytest.mark.parametrize(
+    ("column", "expected"),
+    [
+        ("ammo", [3, 12, None, 91, None, 5]),
+        ("max_ammo", [10, 10, 15, 100, None, 10]),
+        ("unlimited_ammo", [False, True, None, True, True, None]),
+        (
+            "ammo_status",
+            [
+                "calculated",
+                "partial",
+                "unresolved",
+                "partial",
+                "unresolved",
+                "calculated",
+            ],
+        ),
+        (
+            "ammo_diagnostic",
+            [
+                None,
+                "unknown effect",
+                "ammo fraction unavailable",
+                "unknown effect",
+                "missing scaling",
+                None,
+            ],
+        ),
+    ],
+    ids=["rounds", "capacity", "unlimited-state", "status", "diagnostic"],
+)
+def test_ammo_reconstruction_preserves_each_recorded_outcome(
+    reconstructed_ammo, column, expected
+):
+    _, frames = reconstructed_ammo
+    assert frames["player_ticks"][column].to_list() == expected
+
+
+def test_ammo_enrichment_keeps_other_snapshot_tables(reconstructed_ammo):
+    _, frames = reconstructed_ammo
     assert frames["world_ticks"].to_dict(as_series=False) == {"tick": [7]}
+
+
+def test_ammo_enrichment_keeps_snapshot_identity_order(reconstructed_ammo):
+    demo, frames = reconstructed_ammo
     frame = frames["player_ticks"]
     assert "player_slot" not in frame.columns
     assert frame["steam_id"].to_list() == demo.frame["steam_id"].to_list()
-    assert frame["ammo"].to_list() == [3, 12, None, 91, None, 5]
-    assert frame["max_ammo"].to_list() == [10, 10, 15, 100, None, 10]
-    assert frame["unlimited_ammo"].to_list() == [False, True, None, True, True, None]
-    assert frame["ammo_status"].to_list() == [
-        "calculated",
-        "partial",
-        "unresolved",
-        "partial",
-        "unresolved",
-        "calculated",
-    ]
-    assert frame["ammo_diagnostic"].to_list() == [
-        None,
-        "unknown effect",
-        "ammo fraction unavailable",
-        "unknown effect",
-        "missing scaling",
-        None,
-    ]
-    assert frame.schema["ammo"] == frame.schema["max_ammo"] == pl.UInt32
+
+
+def test_ammo_columns_use_unsigned_integer_types(reconstructed_ammo):
+    _, frames = reconstructed_ammo
+    assert (
+        frames["player_ticks"].schema["ammo"]
+        == frames["player_ticks"].schema["max_ammo"]
+        == pl.UInt32
+    )
+
+
+def test_empty_ammo_snapshots_keep_the_nonempty_schema(reconstructed_ammo):
+    _, frames = reconstructed_ammo
     empty = AmmoDemo()
     empty.frame = empty.frame.clear()
     empty_frame = snapshots(cast(Demo, empty), ticks=7, data_version="1234")
-    assert isinstance(empty_frame, pl.DataFrame)
-    assert frame.schema == empty_frame.schema
+    assert frames["player_ticks"].schema == empty_frame.schema
+
+
+def test_ammo_enrichment_forwards_capacity_and_state_queries(reconstructed_ammo):
+    demo, _ = reconstructed_ammo
     assert demo.calls[1:] == [
         (
             "capacity",

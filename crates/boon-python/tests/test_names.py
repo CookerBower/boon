@@ -1,6 +1,5 @@
 """Catalog-backed names, automatic acquisition, and version selection."""
 
-import io
 import json
 import urllib.error
 from pathlib import Path
@@ -15,99 +14,147 @@ from boon import (
     hero_names,
     modifier_names,
 )
-from catalog_helpers import VERSION, release
+from catalog_helpers import VERSION, catalog_upstream, release
 
 
 @pytest.fixture
 def upstream(monkeypatch, tmp_path):
     records = json.loads(Path(__file__).with_name("name-catalogs.json").read_text())
-    index, files = release(records=records)
-    state = {"index": index, "files": files, "requests": [], "records": records}
-    monkeypatch.setattr(data, "BOON_DATA_DIR", tmp_path / "cache")
-
-    def request(url):
-        state["requests"].append(url)
-        return io.BytesIO(
-            json.dumps(state["index"]).encode()
-            if url == data.INDEX_URL
-            else state["files"][url]
-        )
-
-    monkeypatch.setattr(data, "_request", request)
-    return state
+    return catalog_upstream(monkeypatch, tmp_path / "cache", records)
 
 
-@pytest.mark.parametrize("first_lookup", [hero_names, breakable_names])
-def test_name_access_downloads_once_and_reuses_verified_local_files(
-    upstream, first_lookup
-):
-    assert first_lookup()
-    assert hero_names()[1] == "Infernus"
+@pytest.mark.parametrize(
+    "lookup",
+    [hero_names, ability_names, ability_display_names, modifier_names, breakable_names],
+)
+def test_name_lookup_downloads_once_and_reuses_catalog_offline(upstream, lookup):
+    assert lookup()
     assert data.local_versions()[0]["client_version"] == VERSION
-    requests = len(upstream["requests"])
-    assert ability_names()[46922526] == "inherent_base"
-    assert ability_display_names()["citadel_ability_hook"] == "Grapple Arm"
-    assert modifier_names()[1364211883] == "ability_afterburn/modifier_afterburn_dot"
-    assert modifier_names()[3285944580] == "modifier_afterburn_dot"
-    assert breakable_names()[3986897915] == "citadel_breakable_prop_wooden_crate"
-    assert len(upstream["requests"]) == requests
+    before = len(upstream["requests"])
+    upstream["offline"] = True
+    assert lookup()
+    assert len(upstream["requests"]) == before
+
+
+@pytest.mark.parametrize(
+    ("lookup", "key", "expected"),
+    [
+        (hero_names, 1, "Infernus"),
+        (ability_names, 46922526, "inherent_base"),
+        (ability_display_names, "citadel_ability_hook", "Grapple Arm"),
+        (modifier_names, 1364211883, "ability_afterburn/modifier_afterburn_dot"),
+        (modifier_names, 3285944580, "modifier_afterburn_dot"),
+        (breakable_names, 3986897915, "citadel_breakable_prop_wooden_crate"),
+    ],
+)
+def test_catalog_names_match_the_selected_record(upstream, lookup, key, expected):
+    assert lookup()[key] == expected
+
+
+def test_modifying_returned_names_does_not_change_the_cache(upstream):
     names = hero_names()
     names[1] = "caller changed this"
     assert hero_names()[1] == "Infernus"
 
 
-def test_newest_local_and_explicit_versions_use_their_own_names(upstream):
-    hero_names()
-    records = upstream["records"]
-    records["heroes"][0]["display_name"] = "Changed hero"
-    changed_id = records["heroes"][0]["hero_id"]
-    upstream["index"], upstream["files"] = release("6701", records=records)
-    assert (
-        hero_names()[changed_id] != "Changed hero"
-    )  # existing local version, no update
-    assert hero_names("6701")[changed_id] == "Changed hero"
-    assert hero_names()[changed_id] == "Changed hero"
-    assert hero_names(VERSION)[changed_id] != "Changed hero"
+@pytest.fixture(
+    params=[
+        pytest.param((hero_names, "heroes", "hero_id", "display_name"), id="heroes"),
+        pytest.param(
+            (breakable_names, "misc", "misc_id", "misc_name"), id="breakables"
+        ),
+    ]
+)
+def lookup_source(request):
+    return request.param
 
 
-def test_forced_reinstall_invalidates_cached_names(upstream):
-    hero_names()
-    records = upstream["records"]
-    records["heroes"][0]["display_name"] = "Replacement hero name"
-    upstream["index"], upstream["files"] = release(records=records)
+def replace_name(upstream, lookup_source, label, version=VERSION):
+    _, catalog, id_key, label_key = lookup_source
+    record = upstream["records"][catalog][0]
+    record[label_key] = label
+    upstream["index"], upstream["files"] = release(version, records=upstream["records"])
+    return record[id_key]
+
+
+def test_default_names_do_not_refresh_the_remote_index(upstream, lookup_source):
+    lookup = lookup_source[0]
+    lookup()
+    changed_id = replace_name(upstream, lookup_source, "Changed name", "6701")
+    before = len(upstream["requests"])
+    assert lookup()[changed_id] != "Changed name"
+    assert len(upstream["requests"]) == before
+
+
+@pytest.mark.parametrize(
+    "version",
+    [None, VERSION, "6701"],
+    ids=["newest-local", "explicit-old", "explicit-new"],
+)
+def test_names_use_the_requested_local_version(upstream, lookup_source, version):
+    lookup = lookup_source[0]
+    lookup()
+    changed_id = replace_name(upstream, lookup_source, "Changed name", "6701")
+    data.update("6701")
+    actual = lookup(version)[changed_id]
+    assert (actual == "Changed name") == (version != VERSION)
+
+
+def test_forced_reinstall_invalidates_cached_names(upstream, lookup_source):
+    lookup = lookup_source[0]
+    lookup()
+    changed_id = replace_name(upstream, lookup_source, "Replacement name")
     data.update(VERSION, force=True)
-    assert hero_names()[records["heroes"][0]["hero_id"]] == "Replacement hero name"
+    assert lookup()[changed_id] == "Replacement name"
+
+
+def test_removal_invalidates_names_before_reacquisition(upstream, lookup_source):
+    lookup = lookup_source[0]
+    lookup()
+    changed_id = replace_name(upstream, lookup_source, "Replacement name")
     data.remove(VERSION)
-    requests = len(upstream["requests"])
-    assert hero_names()[records["heroes"][0]["hero_id"]] == "Replacement hero name"
-    assert len(upstream["requests"]) > requests
+    before = len(upstream["requests"])
+    assert lookup()[changed_id] == "Replacement name"
+    assert len(upstream["requests"]) > before
 
 
-def test_corruption_is_not_hidden_by_cached_names(upstream, monkeypatch):
+@pytest.fixture
+def corrupt_cached_names(upstream):
     hero_names()
     (data.BOON_DATA_DIR / VERSION / "heroes.json").write_text("corrupt")
+    return upstream
+
+
+def test_explicit_names_reject_a_corrupt_cached_catalog(corrupt_cached_names):
     with pytest.raises(data.DataError, match="boon get.*--force"):
         hero_names(VERSION)
-    monkeypatch.setattr(
-        data,
-        "_request",
-        lambda url: (_ for _ in ()).throw(urllib.error.URLError("offline")),
-    )
+
+
+def test_default_names_do_not_hide_corruption_when_offline(corrupt_cached_names):
+    corrupt_cached_names["offline"] = True
     with pytest.raises(data.DataError, match="offline"):
         hero_names()
 
 
-def test_unlocalized_hero_uses_internal_name_and_invalid_catalog_fails(upstream):
+def test_unlocalized_hero_uses_its_internal_name(upstream):
+    record = upstream["records"]["heroes"][0]
+    record["display_name"] = None
+    upstream["index"], upstream["files"] = release(records=upstream["records"])
+    assert hero_names()[record["hero_id"]] == record["hero_name"]
+
+
+@pytest.mark.parametrize("cached", [False, True], ids=["first-load", "cached"])
+def test_catalog_names_reject_conflicting_ids(upstream, lookup_source, cached):
+    lookup, catalog, _, label_key = lookup_source
+    if cached:
+        lookup()
     records = upstream["records"]
-    records["heroes"][0]["display_name"] = None
+    records[catalog].append({**records[catalog][0], label_key: "Conflict"})
     upstream["index"], upstream["files"] = release(records=records)
-    hero = records["heroes"][0]
-    assert hero_names()[hero["hero_id"]] == hero["hero_name"]
-    records["heroes"].append({**hero, "display_name": "Conflict"})
-    upstream["index"], upstream["files"] = release(records=records)
-    data.update(VERSION, force=True)
+    if cached:
+        data.update(VERSION, force=True)
     with pytest.raises(data.DataError, match="conflicting"):
-        hero_names()
+        lookup()
 
 
 def test_removed_datasets_are_not_public():
@@ -145,36 +192,7 @@ def test_cli_players_reports_catalog_download_failure(upstream, monkeypatch, tmp
     assert "offline" in result.output
 
 
-def test_breakable_names_use_versions_and_invalidate_on_misc_changes(upstream):
-    original = breakable_names()
-    records = upstream["records"]
-    entry = records["misc"][0]
-    entry["misc_name"] = "catalog_replacement"
-    changed_id = entry["misc_id"]
-    upstream["index"], upstream["files"] = release(records=records)
-    data.update(VERSION, force=True)
-    assert breakable_names()[changed_id] == "catalog_replacement"
-    assert original[changed_id] != "catalog_replacement"
-
-    entry["misc_name"] = "new_version_prop"
-    upstream["index"], upstream["files"] = release("6701", records=records)
-    assert breakable_names()[changed_id] == "catalog_replacement"
-    assert breakable_names("6701")[changed_id] == "new_version_prop"
-    assert breakable_names()[changed_id] == "new_version_prop"
-    assert breakable_names(VERSION)[changed_id] == "catalog_replacement"
-
-
-def test_breakable_catalog_rejects_conflicting_ids(upstream):
-    records = upstream["records"]
-    records["misc"].append({**records["misc"][0], "misc_name": "conflict"})
-    upstream["index"], upstream["files"] = release(records=records)
-    with pytest.raises(data.DataError, match="conflicting"):
-        breakable_names()
-
-
-def test_breakable_dataset_uses_catalog_and_retries_failed_download(
-    upstream, monkeypatch
-):
+def test_breakable_retry_preserves_catalog_mapped_rows(upstream, monkeypatch):
     import polars as pl
 
     path = Path(__file__).parent / "fixtures" / "108575009.dem"
@@ -212,7 +230,3 @@ def test_breakable_dataset_uses_catalog_and_retries_failed_download(
         (3986897915, "catalog_crate"): 355,
     }
     assert frame.schema["subclass_id"] == pl.UInt32
-    requests = len(upstream["requests"])
-    demo.load("breakables")
-    assert demo.breakables.equals(frame)
-    assert len(upstream["requests"]) == requests

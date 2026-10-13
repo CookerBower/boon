@@ -3,14 +3,18 @@
 import copy
 import gzip
 import hashlib
+import io
 import json
+import urllib.error
 from pathlib import Path
 
 from boon import data
 
-MODIFIER_VALUE_TYPES = json.loads(gzip.decompress(
-    (Path(__file__).parent / "catalogs/108575009/abilities.json.gz").read_bytes()
-))["modifier_value_types"]
+MODIFIER_VALUE_TYPES = json.loads(
+    gzip.decompress(
+        (Path(__file__).parent / "catalogs/108575009/abilities.json.gz").read_bytes()
+    )
+)["modifier_value_types"]
 
 VERSION = "6698"
 PUBLISHED = "2026-09-22T00:31:49Z"
@@ -79,3 +83,46 @@ def release(version=VERSION, records=None):
         "snapshots": {tag: snapshot},
     }
     return index, {artifacts[name]["url"]: content for name, content in files.items()}
+
+
+def write_empty_catalogs(directory: Path, version: str) -> Path:
+    """Write minimal native-query catalogs with no hero or effect definitions."""
+    for name in ("heroes", "abilities", "modifiers", "misc"):
+        (directory / f"{name}.json").write_text(
+            json.dumps(
+                {
+                    "catalog": name,
+                    "client_version": version,
+                    "source_commit": "a" * 40,
+                    "records": [],
+                }
+            )
+        )
+    return directory
+
+
+def catalog_upstream(monkeypatch, cache: Path, records=None):
+    """Serve an isolated release and record requests without network access."""
+    index, files = release(records=records)
+    state = {
+        "index": index,
+        "files": files,
+        "requests": [],
+        "offline": False,
+        "records": records,
+    }
+    monkeypatch.setattr(data, "BOON_DATA_DIR", cache)
+
+    def request(url):
+        state["requests"].append(url)
+        if state["offline"]:
+            raise urllib.error.URLError("offline")
+        content = (
+            json.dumps(state["index"]).encode()
+            if url == data.INDEX_URL
+            else state["files"][url]
+        )
+        return io.BytesIO(content)
+
+    monkeypatch.setattr(data, "_request", request)
+    return state

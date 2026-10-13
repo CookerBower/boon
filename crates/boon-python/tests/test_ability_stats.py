@@ -7,6 +7,7 @@ import polars as pl
 import pytest
 from boon import AbilityStat, CalculationError, Demo, StatMode, data, rulesets
 from boon.ability_stats import calculate_ability_stats, imbues
+from catalog_helpers import write_empty_catalogs
 
 
 class RecordedResult:
@@ -69,41 +70,94 @@ def test_invalid_stat_query_does_not_download(monkeypatch, options):
         )
 
 
-def test_empty_tables_keep_types_and_selected_version(monkeypatch, tmp_path):
+@pytest.fixture
+def recorded_api(monkeypatch, tmp_path):
     versions = []
     monkeypatch.setattr(
         data, "update", lambda version: versions.append(version) or tmp_path
     )
-    demo = RecordedResult()
-    result = imbues(
-        cast(Demo, demo), ticks=50, steam_ids=[76561197999389679], data_version="1234"
+    return RecordedResult(), versions
+
+
+@pytest.mark.parametrize(
+    ("function", "table", "expected"),
+    [
+        (imbues, "bindings", {"steam_id": pl.UInt64, "ability_id": pl.UInt32}),
+        (imbues, "effects", {"steam_id": pl.UInt64, "value": pl.Float64}),
+        (
+            calculate_ability_stats,
+            "values",
+            {"mode": pl.String, "steam_id": pl.UInt64, "value": pl.Float64},
+        ),
+        (
+            calculate_ability_stats,
+            "contributions",
+            {
+                "mode": pl.String,
+                "steam_id": pl.UInt64,
+                "included": pl.Boolean,
+                "source_ability_id": pl.UInt32,
+            },
+        ),
+    ],
+    ids=["bindings", "effects", "values", "contributions"],
+)
+def test_empty_query_tables_keep_their_types(recorded_api, function, table, expected):
+    recorded, _ = recorded_api
+    result = function(cast(Demo, recorded), ticks=50, data_version="1234")
+    frame = getattr(result, table)
+    assert {name: frame.schema[name] for name in expected} == expected
+
+
+@pytest.mark.parametrize("function", [imbues, calculate_ability_stats])
+def test_query_requests_the_explicit_catalog_version(recorded_api, function):
+    recorded, versions = recorded_api
+    function(cast(Demo, recorded), ticks=50, data_version="1234")
+    assert versions == ["1234"]
+
+
+@pytest.mark.parametrize("function", [imbues, calculate_ability_stats])
+def test_query_metadata_keeps_the_selected_version(recorded_api, function):
+    recorded, _ = recorded_api
+    result = function(cast(Demo, recorded), ticks=50, data_version="1234")
+    assert result.metadata["data_version"] == "1234"
+
+
+def test_imbue_selection_reaches_native_query(recorded_api, tmp_path):
+    recorded, _ = recorded_api
+    imbues(
+        cast(Demo, recorded),
+        ticks=50,
+        steam_ids=[76561197999389679],
+        data_version="1234",
     )
-    assert result.bindings.schema["steam_id"] == pl.UInt64
-    assert result.effects.schema["steam_id"] == pl.UInt64
-    assert result.bindings.schema["ability_id"] == pl.UInt32
-    assert result.effects.schema["value"] == pl.Float64
-    assert result.metadata == {"data_version": "1234"}
-    assert demo.calls[0] == (tmp_path, [50], {"steam_ids": [76561197999389679]})
-    stats = calculate_ability_stats(
-        cast(Demo, demo),
+    assert recorded.calls == [(tmp_path, [50], {"steam_ids": [76561197999389679]})]
+
+
+def test_ability_query_forwards_query_flags(recorded_api):
+    recorded, _ = recorded_api
+    calculate_ability_stats(
+        cast(Demo, recorded),
         ticks=[50, 60],
         data_version="1234",
         include_items=True,
         explain=True,
         strict=False,
     )
-    assert stats.metadata["mode"] == "current"
-    assert demo.calls[1][2]["mode"] == "current"
-    assert stats.values.schema["mode"] == pl.String
-    assert stats.contributions.schema["mode"] == pl.String
-    assert stats.values.schema["steam_id"] == pl.UInt64
-    assert stats.contributions.schema["steam_id"] == pl.UInt64
-    assert stats.values.schema["value"] == pl.Float64
-    assert stats.contributions.schema["included"] == pl.Boolean
-    assert stats.contributions.schema["source_ability_id"] == pl.UInt32
-    assert versions == ["1234", "1234"]
-    assert demo.calls[1][2]["include_items"] is True
-    assert demo.calls[1][2]["strict"] is False
+    options = recorded.calls[0][2]
+    assert {name: options[name] for name in ("include_items", "explain", "strict")} == {
+        "include_items": True,
+        "explain": True,
+        "strict": False,
+    }
+
+
+def test_ability_query_defaults_to_current_mode(recorded_api):
+    recorded, _ = recorded_api
+    result = calculate_ability_stats(
+        cast(Demo, recorded), ticks=50, data_version="1234"
+    )
+    assert recorded.calls[0][2]["mode"] == result.metadata["mode"] == "current"
 
 
 @pytest.mark.parametrize("function", [imbues, calculate_ability_stats])
@@ -120,56 +174,92 @@ def test_native_errors_keep_their_message(monkeypatch, tmp_path, function):
         function(Failure(), ticks=50, data_version="1234")
 
 
-def test_native_steam_selection_and_imbue_identity(demo: Demo, tmp_path, monkeypatch):
-    # Sample a recorded tick; fixture lengths differ across CI jobs.
+@pytest.fixture(scope="module")
+def native_catalog(tmp_path_factory):
+    return write_empty_catalogs(
+        tmp_path_factory.mktemp("ability-query-catalog"), "1234"
+    )
+
+
+@pytest.fixture
+def installed_native_catalog(monkeypatch, native_catalog):
+    monkeypatch.setattr(data, "update", lambda _: native_catalog)
+
+
+@pytest.fixture(scope="module")
+def native_imbues(demo: Demo, native_catalog):
     ticks = demo.ability_ticks["tick"].unique().sort()
     tick = ticks[len(ticks) // 2]
-    for name in ("heroes", "abilities", "modifiers", "misc"):
-        (tmp_path / f"{name}.json").write_text(
-            json.dumps(
-                {
-                    "catalog": name,
-                    "client_version": "1234",
-                    "source_commit": "a" * 40,
-                    "records": [],
-                }
-            )
-        )
-    monkeypatch.setattr(data, "update", lambda _: tmp_path)
-    all_imbues = demo.imbues(ticks=tick, data_version="1234")
-    assert "mode" not in all_imbues.metadata
-    assert "player_slot" not in all_imbues.bindings.columns
-    assert "player_slot" not in all_imbues.effects.columns
-    assert all_imbues.bindings.height > 0
-    steam_id = all_imbues.bindings["steam_id"][0]
-    assert steam_id in demo.players["steam_id"]
-    selected = demo.imbues(ticks=tick, steam_ids=[steam_id], data_version="1234")
-    assert selected.bindings.equals(
-        all_imbues.bindings.filter(pl.col("steam_id") == steam_id)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(data, "update", lambda _: native_catalog)
+        result = demo.imbues(ticks=tick, data_version="1234")
+    return tick, result
+
+
+def test_native_imbue_identity_uses_roster_steam_ids(demo: Demo, native_imbues):
+    _, result = native_imbues
+    assert "player_slot" not in result.bindings.columns
+    assert "player_slot" not in result.effects.columns
+    assert result.bindings.height > 0
+    assert result.bindings["steam_id"][0] in demo.players["steam_id"]
+
+
+def test_imbues_have_no_stat_mode(native_imbues):
+    assert "mode" not in native_imbues[1].metadata
+
+
+@pytest.fixture(scope="module")
+def selected_native_imbues(demo: Demo, native_imbues, native_catalog):
+    tick, full = native_imbues
+    steam_id = full.bindings["steam_id"][0]
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(data, "update", lambda _: native_catalog)
+        selected = demo.imbues(ticks=tick, steam_ids=[steam_id], data_version="1234")
+    return steam_id, selected
+
+
+@pytest.mark.parametrize("table", ["bindings", "effects"])
+def test_native_imbue_steam_selection_matches_filtered_result(
+    native_imbues, selected_native_imbues, table
+):
+    _, full = native_imbues
+    steam_id, selected = selected_native_imbues
+    assert getattr(selected, table).equals(
+        getattr(full, table).filter(pl.col("steam_id") == steam_id)
     )
-    assert selected.effects.equals(
-        all_imbues.effects.filter(pl.col("steam_id") == steam_id)
-    )
-    # Selection validation does not require a mid-match replay pass.
-    first_tick = ticks[0]
-    for function in (demo.imbues, demo.calculate_ability_stats):
-        with pytest.raises(CalculationError, match="Steam ID 1 has no hero"):
-            function(ticks=first_tick, steam_ids=[1], data_version="1234")
+
+
+@pytest.mark.parametrize("method", ["imbues", "calculate_ability_stats"])
+def test_native_ability_query_rejects_unknown_steam_ids(
+    demo: Demo, installed_native_catalog, method
+):
+    tick = demo.ability_ticks["tick"].min()
+    with pytest.raises(CalculationError, match="Steam ID 1 has no hero"):
+        getattr(demo, method)(ticks=tick, steam_ids=[1], data_version="1234")
+
+
+def test_empty_native_imbue_selection_returns_no_bindings(
+    demo: Demo, installed_native_catalog
+):
+    tick = demo.ability_ticks["tick"].min()
     assert demo.imbues(
-        ticks=first_tick, steam_ids=[], data_version="1234"
+        ticks=tick, steam_ids=[], data_version="1234"
     ).bindings.is_empty()
-    for mode in StatMode:
-        result = demo.calculate_ability_stats(
-            ticks=first_tick,
-            steam_ids=[],
-            data_version="1234",
-            mode=mode,
-        )
-        assert result.values.is_empty()
-        assert "player_slot" not in result.values.columns
-        assert "player_slot" not in result.contributions.columns
-        assert result.metadata["mode"] == mode
-        assert result.values.schema["mode"] == pl.String
+
+
+@pytest.mark.parametrize("mode", list(StatMode))
+def test_empty_native_ability_selection_keeps_mode_schema(
+    demo: Demo, installed_native_catalog, mode
+):
+    tick = demo.ability_ticks["tick"].min()
+    result = demo.calculate_ability_stats(
+        ticks=tick, steam_ids=[], data_version="1234", mode=mode
+    )
+    assert result.values.is_empty()
+    assert "player_slot" not in result.values.columns
+    assert "player_slot" not in result.contributions.columns
+    assert result.metadata["mode"] == mode
+    assert result.values.schema["mode"] == pl.String
 
 
 @pytest.mark.parametrize(

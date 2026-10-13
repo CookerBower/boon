@@ -28,10 +28,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preserves_percentage_points_and_rejects_nonfinite_totals() {
+    fn preserves_percentage_points() {
         for percent in [0.0, 37.5, -10.0, 225.0] {
             assert_eq!(calculate(percent).unwrap(), percent);
         }
+    }
+
+    #[test]
+    fn rejects_nonfinite_totals() {
         for percent in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(calculate(percent).is_err());
         }

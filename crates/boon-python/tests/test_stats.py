@@ -3,6 +3,7 @@
 from typing import cast
 
 import polars as pl
+import pytest
 from boon import Demo, stats
 
 
@@ -58,20 +59,34 @@ class TestKillParticipation:
 
     def test_value_is_kills_plus_assists_over_team_kills(self, demo: Demo) -> None:
         kp = stats.kill_participation(demo)
-        recomputed = pl.when(pl.col("team_kills") > 0).then(
-            (pl.col("kills") + pl.col("assists")) / pl.col("team_kills")
-        ).otherwise(None)
+        recomputed = (
+            pl.when(pl.col("team_kills") > 0)
+            .then((pl.col("kills") + pl.col("assists")) / pl.col("team_kills"))
+            .otherwise(None)
+        )
         check = kp.with_columns(recomputed.alias("expected"))
-        assert check.select(
-            (pl.col("kill_participation") == pl.col("expected"))
-            | (pl.col("kill_participation").is_null() & pl.col("expected").is_null())
-        ).to_series().all()
+        assert (
+            check.select(
+                (pl.col("kill_participation") == pl.col("expected"))
+                | (
+                    pl.col("kill_participation").is_null()
+                    & pl.col("expected").is_null()
+                )
+            )
+            .to_series()
+            .all()
+        )
 
     def test_participation_in_unit_interval(self, demo: Demo) -> None:
         kp = stats.kill_participation(demo).drop_nulls("kill_participation")
-        assert kp.select(
-            (pl.col("kill_participation") >= 0.0) & (pl.col("kill_participation") <= 1.0)
-        ).to_series().all()
+        assert (
+            kp.select(
+                (pl.col("kill_participation") >= 0.0)
+                & (pl.col("kill_participation") <= 1.0)
+            )
+            .to_series()
+            .all()
+        )
 
     def test_team_kills_equals_sum_of_member_kills(self, demo: Demo) -> None:
         # Each team kill has exactly one killer on that team, so a team's
@@ -91,9 +106,11 @@ class TestKillParticipation:
     def test_empty_window_has_no_kills(self, demo: Demo) -> None:
         empty = demo.kill_participation(start_tick=10**12)
         assert empty.height == demo.players.height
-        assert empty.select(
-            pl.col("kills", "assists", "team_kills").sum()
-        ).row(0) == (0, 0, 0)
+        assert empty.select(pl.col("kills", "assists", "team_kills").sum()).row(0) == (
+            0,
+            0,
+            0,
+        )
         assert empty["kill_participation"].is_null().all()
 
 
@@ -154,22 +171,32 @@ class TestTimeDead:
             (pl.col("ticks_dead") / rate).alias("exp_seconds"),
             (pl.col("ticks_dead") / reg * 100).alias("exp_pct"),
         )
-        assert check.select(
-            (pl.col("seconds_dead") == pl.col("exp_seconds"))
-            & (pl.col("pct_regulation_dead") == pl.col("exp_pct"))
-        ).to_series().all()
+        assert (
+            check.select(
+                (pl.col("seconds_dead") == pl.col("exp_seconds"))
+                & (pl.col("pct_regulation_dead") == pl.col("exp_pct"))
+            )
+            .to_series()
+            .all()
+        )
 
     def test_within_regulation_bounds(self, demo: Demo) -> None:
         td = stats.time_dead(demo)
         reg = demo.regulation_ticks
         # Dead ticks never exceed regulation; percentage stays in [0, 100].
-        assert td.select(
-            (pl.col("ticks_dead") >= 0) & (pl.col("ticks_dead") <= reg)
-        ).to_series().all()
-        assert td.select(
-            (pl.col("pct_regulation_dead") >= 0.0)
-            & (pl.col("pct_regulation_dead") <= 100.0)
-        ).to_series().all()
+        assert (
+            td.select((pl.col("ticks_dead") >= 0) & (pl.col("ticks_dead") <= reg))
+            .to_series()
+            .all()
+        )
+        assert (
+            td.select(
+                (pl.col("pct_regulation_dead") >= 0.0)
+                & (pl.col("pct_regulation_dead") <= 100.0)
+            )
+            .to_series()
+            .all()
+        )
 
 
 TF_COLUMNS = [
@@ -188,6 +215,13 @@ TF_COLUMNS = [
 ]
 
 
+@pytest.fixture(scope="module")
+def teamfight_frame(demo: Demo) -> pl.DataFrame:
+    frame = stats.teamfights(demo)
+    assert not frame.is_empty(), "fixture must contain a teamfight"
+    return frame
+
+
 class TestTeamfights:
     def test_columns(self, demo: Demo) -> None:
         assert stats.teamfights(demo).columns == TF_COLUMNS
@@ -195,21 +229,34 @@ class TestTeamfights:
     def test_method_matches_function(self, demo: Demo) -> None:
         assert demo.teamfights().equals(stats.teamfights(demo))
 
-    def test_invariants(self, demo: Demo) -> None:
-        tf = stats.teamfights(demo)
-        if tf.is_empty():
-            return
-        # A fight involves >= min_players heroes and takes non-negative time.
-        assert (tf["num_participants"] >= 3).all()
-        assert (tf["participants"].list.len() == tf["num_participants"]).all()
-        assert (tf["hero_damage"] > 0).all()
-        assert (tf["duration_seconds"] >= 0.0).all()
-        assert (tf["end_tick"] >= tf["start_tick"]).all()
-        # fight_id is 1..N in start-tick order.
-        assert tf["fight_id"].to_list() == list(range(1, tf.height + 1))
-        assert tf["start_tick"].is_sorted()
-        # Each kill is attributed to at most one fight -- never double-counted.
-        assert tf["kills"].sum() <= demo.kills.height
+    def test_minimum_participant_count(self, teamfight_frame) -> None:
+        assert (teamfight_frame["num_participants"] >= 3).all()
+
+    def test_participant_count_matches_list(self, teamfight_frame) -> None:
+        assert (
+            teamfight_frame["participants"].list.len()
+            == teamfight_frame["num_participants"]
+        ).all()
+
+    def test_fights_have_positive_damage(self, teamfight_frame) -> None:
+        assert (teamfight_frame["hero_damage"] > 0).all()
+
+    def test_fight_durations_are_nonnegative(self, teamfight_frame) -> None:
+        assert (teamfight_frame["duration_seconds"] >= 0.0).all()
+
+    def test_fights_cannot_end_before_they_start(self, teamfight_frame) -> None:
+        assert (teamfight_frame["end_tick"] >= teamfight_frame["start_tick"]).all()
+
+    def test_fight_ids_follow_start_tick_order(self, teamfight_frame) -> None:
+        assert teamfight_frame["fight_id"].to_list() == list(
+            range(1, teamfight_frame.height + 1)
+        )
+        assert teamfight_frame["start_tick"].is_sorted()
+
+    def test_kills_are_counted_in_at_most_one_fight(
+        self, teamfight_frame, demo: Demo
+    ) -> None:
+        assert teamfight_frame["kills"].sum() <= demo.kills.height
 
     def test_min_players_filter(self, demo: Demo) -> None:
         # An impossibly high min_players yields no fights.

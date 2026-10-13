@@ -87,7 +87,8 @@ def test_components_need_a_unique_player_and_tick_match(components, events, expe
     assert sources.to_list() == expected
 
 
-def test_catalog_selection_and_refresh(monkeypatch, tmp_path):
+@pytest.fixture
+def catalog_purchase(monkeypatch, tmp_path):
     path = tmp_path / "abilities.json"
     catalog = json.loads(
         (Path(__file__).parent / "catalogs" / "item-components.json").read_text()
@@ -111,15 +112,39 @@ def test_catalog_selection_and_refresh(monkeypatch, tmp_path):
         }
     )
     demo = cast(Demo, SimpleNamespace(_item_purchases=raw))
+    return demo, path, catalog, versions
+
+
+def test_catalog_components_identify_an_upgrade(catalog_purchase):
+    demo, _, _, _ = catalog_purchase
     result = get_item_purchases(demo)
     assert result["upgraded_from_ability_ids"].to_list() == [[1548066885], []]
-    assert_frame_equal(result.drop("upgraded_from_ability_ids"), raw)
+
+
+def test_upgrade_enrichment_preserves_recorded_events(catalog_purchase):
+    demo, _, _, _ = catalog_purchase
+    result = get_item_purchases(demo)
+    assert_frame_equal(result.drop("upgraded_from_ability_ids"), demo._item_purchases)
+
+
+@pytest.mark.parametrize("version", [None, "6712"], ids=["default", "explicit"])
+def test_upgrade_query_selects_the_requested_catalog(catalog_purchase, version):
+    demo, _, _, versions = catalog_purchase
+    get_item_purchases(demo, data_version=version)
+    assert versions == [version]
+
+
+def test_changed_catalog_refreshes_upgrade_components(catalog_purchase):
+    demo, path, catalog, _ = catalog_purchase
+    get_item_purchases(demo)
     catalog["records"][1]["definition"]["m_vecComponentItems"] = []
     path.write_text(json.dumps(catalog))
-    assert get_item_purchases(demo, data_version="6712")[
-        "upgraded_from_ability_ids"
-    ].to_list() == [[], []]
-    assert versions == [None, "6712"]
+    result = get_item_purchases(demo, data_version="6712")
+    assert result["upgraded_from_ability_ids"].to_list() == [[], []]
+
+
+def test_malformed_upgrade_catalog_has_an_actionable_error(catalog_purchase):
+    demo, path, _, _ = catalog_purchase
     path.write_text("{}")
     with pytest.raises(data.DataError, match="could not read item components"):
         get_item_purchases(demo)
@@ -134,10 +159,15 @@ def test_empty_events_do_not_need_catalogs():
     assert result.schema["upgraded_from_ability_ids"] == pl.List(pl.UInt32)
 
 
-def test_haze_titanic_magazine_consumes_extended_magazine(demo, monkeypatch):
+@pytest.fixture
+def catalog_purchases(demo, monkeypatch):
     path = Path(__file__).parent / "catalogs" / "item-components.json"
     monkeypatch.setattr(data, "catalog_path", lambda name, version: path)
-    purchases = demo.get_item_purchases(data_version="6712")
+    return demo.get_item_purchases(data_version="6712")
+
+
+def test_haze_titanic_magazine_consumes_extended_magazine(catalog_purchases):
+    purchases = catalog_purchases
     pair = purchases.filter(
         (pl.col("tick") == 23567) & (pl.col("steam_id") == 76561199122465399)
     )
@@ -147,6 +177,12 @@ def test_haze_titanic_magazine_consumes_extended_magazine(demo, monkeypatch):
         (13, 2356412290, "purchased", [1548066885]),
         (13, 1548066885, "sold", []),
     ]
-    assert pair.schema["steam_id"] == pl.UInt64
-    assert pair.schema["upgraded_from_ability_ids"] == pl.List(pl.UInt32)
-    assert_frame_equal(demo.item_purchases, purchases)
+
+
+def test_item_purchase_property_matches_explicit_query(demo, catalog_purchases):
+    assert_frame_equal(demo.item_purchases, catalog_purchases)
+
+
+def test_enriched_purchase_schema_keeps_unsigned_ids(catalog_purchases):
+    assert catalog_purchases.schema["steam_id"] == pl.UInt64
+    assert catalog_purchases.schema["upgraded_from_ability_ids"] == pl.List(pl.UInt32)

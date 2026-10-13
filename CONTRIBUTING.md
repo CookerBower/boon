@@ -252,6 +252,20 @@ Use function-scoped `monkeypatch` for temporary settings and `tmp_path` for muta
 files. Use `tmp_path_factory` for catalog files shared by module or session fixtures.
 Keep fixture dependencies explicit. Do not call fixture functions directly.
 
+### Focused test cases
+
+Each test checks one behavior. Use multiple assertions when they describe the same result.
+Separate independent results into named tests. Use parameters for input variants of one behavior.
+
+Share expensive, unchanged query results through module or session fixtures.
+Keep mutable files, test doubles, and settings local to each test.
+Use a fresh parser when the test checks parsing, caching, or decoder settings.
+
+Keep regression tests for distinct errors and parsing paths.
+Remove duplicate checks only when another test covers the same behavior and path.
+Use exact DataFrame comparisons where exact values are required.
+Ensure thread and environment cleanup also runs when an assertion fails.
+
 ### Adding a new fixture
 
 1. Place the `.dem` file in `crates/boon-python/tests/fixtures/` locally.

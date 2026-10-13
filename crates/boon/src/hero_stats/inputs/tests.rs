@@ -2116,8 +2116,7 @@ fn velocity_uses_catalog_values_and_counts_bound_effects_only_when_active() {
     );
 }
 
-#[test]
-fn conditional_properties_use_the_unique_owner_modifier_with_diagnostics() {
+fn conditional_catalog(configure: impl FnOnce(&mut Value, &mut Value)) -> StatCatalog {
     let folder = super::super::catalog::tests::fixture();
     let ability_path = folder.path().join("abilities.json");
     let modifier_path = folder.path().join("modifiers.json");
@@ -2125,177 +2124,233 @@ fn conditional_properties_use_the_unique_owner_modifier_with_diagnostics() {
         serde_json::from_slice(&std::fs::read(&ability_path).unwrap()).unwrap();
     let mut modifiers: Value =
         serde_json::from_slice(&std::fs::read(&modifier_path).unwrap()).unwrap();
-    let effect = json!({
-        "stat":"MODIFIER_VALUE_FIRE_RATE", "property_name":"AnyBonus", "value":27.5,
-        "definition_path":"/test_gun/m_mapAbilityProperties/AnyBonus",
-        "usage_flags":"ConditionallyApplied", "modifier_keys":[]
-    });
-    abilities["records"][0]["stat_changes"] = json!([effect]);
+    abilities["records"][0]["stat_changes"] = json!([conditional_effect(27.5)]);
     modifiers["records"][1]["ability_id"] = json!(456);
     modifiers["records"][2]["ability_id"] = json!(123);
     modifiers["records"][2]["definition_path"] = json!("/test_gun/m_BuffModifier");
+    configure(&mut abilities, &mut modifiers);
+    std::fs::write(&ability_path, serde_json::to_vec(&abilities).unwrap()).unwrap();
     std::fs::write(&modifier_path, serde_json::to_vec(&modifiers).unwrap()).unwrap();
-    let entry = CModifierTableEntry {
+    StatCatalog::from_directory(folder.path()).unwrap()
+}
+
+fn conditional_effect(value: f64) -> Value {
+    json!({"stat":"MODIFIER_VALUE_FIRE_RATE", "property_name":"AnyBonus", "value":value,
+        "definition_path":"/test_gun/m_mapAbilityProperties/AnyBonus",
+        "usage_flags":"ConditionallyApplied", "modifier_keys":[]})
+}
+
+fn conditional_entry() -> CModifierTableEntry {
+    CModifierTableEntry {
         modifier_subclass: Some(12),
         ability_subclass: Some(123),
         serial_number: Some(42),
         last_applied_time: Some(10.0),
         duration: Some(5.0),
         ..Default::default()
-    };
-    let mut inferred = BTreeSet::new();
+    }
+}
+
+#[test]
+fn conditional_bonus_requires_an_active_application() {
+    let catalog = conditional_catalog(|_, _| {});
+    let (value, trace, ignored) = stat_result_with_modifier(
+        &catalog,
+        HeroStat::FireRate,
+        vec![],
+        None,
+        true,
+        &mut BTreeSet::new(),
+    );
+    assert_eq!(value.unwrap(), 0.0);
+    assert!(trace.is_empty() && ignored.is_empty());
+}
+
+#[test]
+fn conditional_bonus_uses_catalog_values_for_owners_and_recipients() {
     for bonus in [27.5, 83.0] {
-        abilities["records"][0]["stat_changes"][0]["value"] = json!(bonus);
-        std::fs::write(&ability_path, serde_json::to_vec(&abilities).unwrap()).unwrap();
-        let catalog = StatCatalog::from_directory(folder.path()).unwrap();
-        let (value, trace, ignored) = stat_result_with_modifier(
-            &catalog,
-            HeroStat::FireRate,
-            vec![],
-            None,
-            true,
-            &mut inferred,
-        );
-        assert_eq!(value.unwrap(), 0.0);
-        assert!(trace.is_empty() && ignored.is_empty());
-        assert_eq!(inferred.len(), 1);
-        // Buff recipients need not own the source ability themselves.
+        let catalog = conditional_catalog(|abilities, _| {
+            abilities["records"][0]["stat_changes"][0]["value"] = json!(bonus)
+        });
         for owned in [false, true] {
-            let (value, trace, ignored) = stat_result_with_modifier(
+            let value = stat_result_with_modifier(
                 &catalog,
                 HeroStat::FireRate,
                 vec![],
-                Some(&entry),
+                Some(&conditional_entry()),
                 owned,
-                &mut inferred,
-            );
+                &mut BTreeSet::new(),
+            )
+            .0;
             assert_eq!(value.unwrap(), bonus);
-            assert!(ignored.is_empty());
-            assert_eq!(inferred.len(), 1);
-            assert!(
-                inferred
-                    .first()
-                    .unwrap()
-                    .contains("AnyBonus in abilities#/test_gun -> abilities#/second")
-            );
-            assert_eq!(trace.len(), 1);
+        }
+    }
+}
+
+#[test]
+fn inferred_conditional_bindings_report_their_source() {
+    let catalog = conditional_catalog(|_, _| {});
+    for active in [false, true] {
+        let entry = conditional_entry();
+        let mut inferred = BTreeSet::new();
+        let (_, trace, ignored) = stat_result_with_modifier(
+            &catalog,
+            HeroStat::FireRate,
+            vec![],
+            active.then_some(&entry),
+            true,
+            &mut inferred,
+        );
+        assert!(ignored.is_empty());
+        assert_eq!(inferred.len(), 1);
+        assert!(
+            inferred
+                .first()
+                .unwrap()
+                .contains("AnyBonus in abilities#/test_gun -> abilities#/second")
+        );
+        assert_eq!(trace.len(), usize::from(active));
+        if active {
             assert_eq!(trace[0].modifier_serial, Some(42));
         }
     }
-    let catalog = StatCatalog::from_directory(folder.path()).unwrap();
+}
+
+#[test]
+fn conditional_bonus_rejects_unusable_durations() {
+    let catalog = conditional_catalog(|_, _| {});
     for duration in [None, Some(-1.0), Some(0.0), Some(f32::INFINITY)] {
-        let untimed = CModifierTableEntry {
+        let entry = CModifierTableEntry {
             duration,
-            ..entry.clone()
+            ..conditional_entry()
         };
         let error = stat_result_with_modifier(
             &catalog,
             HeroStat::FireRate,
             vec![],
-            Some(&untimed),
+            Some(&entry),
             true,
-            &mut inferred,
+            &mut BTreeSet::new(),
         )
         .0
         .unwrap_err();
         assert!(error.to_string().contains("untimed modifier"));
     }
-    let missing_time = CModifierTableEntry {
+}
+
+#[test]
+fn conditional_bonus_requires_a_known_application_time() {
+    let catalog = conditional_catalog(|_, _| {});
+    let entry = CModifierTableEntry {
         last_applied_time: None,
-        ..entry.clone()
+        ..conditional_entry()
     };
-    assert!(
-        stat_result_with_modifier(
-            &catalog,
-            HeroStat::FireRate,
-            vec![],
-            Some(&missing_time),
-            true,
-            &mut inferred
-        )
-        .0
-        .unwrap_err()
-        .to_string()
-        .contains("expiry")
-    );
-    let stacked = CModifierTableEntry {
-        stack_count: Some(2),
-        ..entry.clone()
-    };
-    assert!(
-        stat_result_with_modifier(
-            &catalog,
-            HeroStat::FireRate,
-            vec![],
-            Some(&stacked),
-            true,
-            &mut inferred
-        )
-        .0
-        .unwrap_err()
-        .to_string()
-        .contains("stacking")
-    );
-
-    // A permanent intrinsic modifier is not an activation signal.
-    modifiers["records"][2]["definition_path"] = json!("/test_gun/m_AutoIntrinsicModifiers/0");
-    std::fs::write(&modifier_path, serde_json::to_vec(&modifiers).unwrap()).unwrap();
-    let catalog = StatCatalog::from_directory(folder.path()).unwrap();
-    for active in [false, true] {
-        assert!(
-            stat_result(&catalog, active, HeroStat::FireRate)
-                .0
-                .unwrap_err()
-                .to_string()
-                .contains("no activation binding")
-        );
-    }
-    // Even one active instance cannot disambiguate multiple catalog candidates.
-    modifiers["records"][2]["definition_path"] = json!("/test_gun/m_BuffModifier");
-    modifiers["records"][1]["ability_id"] = json!(123);
-    modifiers["records"][1]["definition_path"] = json!("/test_gun/m_OtherModifier");
-    std::fs::write(&modifier_path, serde_json::to_vec(&modifiers).unwrap()).unwrap();
-    let catalog = StatCatalog::from_directory(folder.path()).unwrap();
-    for active in [false, true] {
-        assert!(
-            stat_result(&catalog, active, HeroStat::FireRate)
-                .0
-                .unwrap_err()
-                .to_string()
-                .contains("no activation binding")
-        );
-    }
-
-    assert!(
-        stat_result_with_modifier(
-            &catalog,
-            HeroStat::FireRate,
-            vec![],
-            Some(&entry),
-            false,
-            &mut inferred
-        )
-        .0
-        .unwrap_err()
-        .to_string()
-        .contains("no unique conditional modifier")
-    );
-
-    // Explicit catalog bindings take priority and do not need inference.
-    abilities["records"][0]["stat_changes"][0]["modifier_keys"] = json!(["abilities#/second"]);
-    modifiers["records"][2]["stat_changes"] = json!([effect, effect]);
-    std::fs::write(&ability_path, serde_json::to_vec(&abilities).unwrap()).unwrap();
-    std::fs::write(&modifier_path, serde_json::to_vec(&modifiers).unwrap()).unwrap();
-    let catalog = StatCatalog::from_directory(folder.path()).unwrap();
-    assert_eq!(
-        stat_result(&catalog, false, HeroStat::FireRate).0.unwrap(),
-        0.0
-    );
-    let (value, trace, ignored) = stat_result_with_modifier(
+    let error = stat_result_with_modifier(
         &catalog,
         HeroStat::FireRate,
         vec![],
         Some(&entry),
+        true,
+        &mut BTreeSet::new(),
+    )
+    .0
+    .unwrap_err();
+    assert!(error.to_string().contains("expiry"));
+}
+
+#[test]
+fn conditional_bonus_rejects_unspecified_stacking() {
+    let catalog = conditional_catalog(|_, _| {});
+    let entry = CModifierTableEntry {
+        stack_count: Some(2),
+        ..conditional_entry()
+    };
+    let error = stat_result_with_modifier(
+        &catalog,
+        HeroStat::FireRate,
+        vec![],
+        Some(&entry),
+        true,
+        &mut BTreeSet::new(),
+    )
+    .0
+    .unwrap_err();
+    assert!(error.to_string().contains("stacking"));
+}
+
+#[test]
+fn permanent_intrinsic_modifiers_do_not_signal_conditional_activation() {
+    let catalog = conditional_catalog(|_, modifiers| {
+        modifiers["records"][2]["definition_path"] = json!("/test_gun/m_AutoIntrinsicModifiers/0")
+    });
+    for active in [false, true] {
+        assert!(
+            stat_result(&catalog, active, HeroStat::FireRate)
+                .0
+                .unwrap_err()
+                .to_string()
+                .contains("no activation binding")
+        );
+    }
+}
+
+fn ambiguous_conditional_catalog() -> StatCatalog {
+    conditional_catalog(|_, modifiers| {
+        modifiers["records"][1]["ability_id"] = json!(123);
+        modifiers["records"][1]["definition_path"] = json!("/test_gun/m_OtherModifier");
+    })
+}
+
+#[test]
+fn an_active_instance_cannot_disambiguate_catalog_candidates() {
+    let catalog = ambiguous_conditional_catalog();
+    for active in [false, true] {
+        assert!(
+            stat_result(&catalog, active, HeroStat::FireRate)
+                .0
+                .unwrap_err()
+                .to_string()
+                .contains("no activation binding")
+        );
+    }
+}
+
+#[test]
+fn recipients_require_a_unique_conditional_modifier() {
+    let catalog = ambiguous_conditional_catalog();
+    let error = stat_result_with_modifier(
+        &catalog,
+        HeroStat::FireRate,
+        vec![],
+        Some(&conditional_entry()),
+        false,
+        &mut BTreeSet::new(),
+    )
+    .0
+    .unwrap_err();
+    assert!(error.to_string().contains("no unique conditional modifier"));
+}
+
+#[test]
+fn explicit_conditional_bindings_take_priority_without_inference() {
+    let catalog = conditional_catalog(|abilities, modifiers| {
+        abilities["records"][0]["stat_changes"][0]["value"] = json!(83.0);
+        abilities["records"][0]["stat_changes"][0]["modifier_keys"] = json!(["abilities#/second"]);
+        modifiers["records"][1]["ability_id"] = json!(123);
+        modifiers["records"][1]["definition_path"] = json!("/test_gun/m_OtherModifier");
+        modifiers["records"][2]["stat_changes"] =
+            json!([conditional_effect(27.5), conditional_effect(27.5)]);
+    });
+    assert_eq!(
+        stat_result(&catalog, false, HeroStat::FireRate).0.unwrap(),
+        0.0
+    );
+    let mut inferred = BTreeSet::new();
+    let (value, trace, ignored) = stat_result_with_modifier(
+        &catalog,
+        HeroStat::FireRate,
+        vec![],
+        Some(&conditional_entry()),
         true,
         &mut inferred,
     );
@@ -2839,44 +2894,63 @@ fn zero_hero_scaling_needs_no_spirit_and_unknown_scaling_fails() {
     );
 }
 
-#[test]
-fn reload_time_uses_catalog_duration_and_only_effective_adjustments() {
+fn reload_catalog(base: f64, single: bool) -> StatCatalog {
     let folder = super::super::catalog::tests::fixture();
-    let ability_path = folder.path().join("abilities.json");
-    let modifier_path = folder.path().join("modifiers.json");
-    let mut abilities: Value =
-        serde_json::from_slice(&std::fs::read(&ability_path).unwrap()).unwrap();
-    let mut modifiers: Value =
-        serde_json::from_slice(&std::fs::read(&modifier_path).unwrap()).unwrap();
-    let stat = "MODIFIER_VALUE_RELOAD_SPEED";
-    let catalog = StatCatalog::from_directory(folder.path()).unwrap();
-    assert!(
-        stat_result(&catalog, false, HeroStat::ReloadTime)
-            .0
-            .unwrap_err()
-            .to_string()
-            .contains("base reload duration")
-    );
+    let mut catalog = StatCatalog::from_directory(folder.path()).unwrap();
+    let weapon = catalog.abilities.get_mut(&123).unwrap();
+    weapon.definition["m_mapWeaponInfos"]["primary"] = json!({
+        "m_reloadDuration":base, "m_bReloadSingleBullets":single,
+        "m_flReloadSingleBulletsInitialDelay":0.7, "m_iClipSize":30
+    });
+    weapon.stat_changes = vec![
+        json!({"stat":"MODIFIER_VALUE_RELOAD_SPEED", "value":-20,
+            "definition_path":"/test_gun/reload", "modifier_keys":["abilities#/second"]}),
+        json!({"stat":"MODIFIER_VALUE_MELEE_TRAVEL_DISTANCE_PERCENTAGE", "value":50}),
+    ];
+    let effect = json!({"stat":"MODIFIER_VALUE_RELOAD_SPEED", "value":-20,
+        "definition_path":"/test_gun/reload"});
+    catalog.modifiers[2].stat_changes = vec![effect.clone(), effect];
+    catalog
+}
 
-    let effect = json!({"stat":stat, "value":-20, "definition_path":"/test_gun/reload"});
-    // The bound adjustment counts once, even if its binding is duplicated.
-    abilities["records"][0]["stat_changes"] = json!([
-        {"stat":stat, "value":-20, "definition_path":"/test_gun/reload", "modifier_keys":["abilities#/second"]},
-        {"stat":"MODIFIER_VALUE_MELEE_TRAVEL_DISTANCE_PERCENTAGE", "value":50}
-    ]);
-    modifiers["records"][2]["stat_changes"] = json!([effect, effect]);
-    std::fs::write(&modifier_path, serde_json::to_vec(&modifiers).unwrap()).unwrap();
+fn passive_reload_catalog() -> StatCatalog {
+    let mut catalog = reload_catalog(0.4, true);
+    catalog.abilities.get_mut(&123).unwrap().stat_changes[0] = json!({
+        "stat":"MODIFIER_VALUE_RELOAD_SPEED", "value":-10,
+        "definition_path":"/test_gun/passive", "usage_flags":"IntrinsicallyProvidedInAbility"
+    });
+    catalog
+}
+
+#[test]
+fn reload_time_requires_a_base_duration() {
+    let folder = super::super::catalog::tests::fixture();
+    let catalog = StatCatalog::from_directory(folder.path()).unwrap();
+    let error = stat_result(&catalog, false, HeroStat::ReloadTime)
+        .0
+        .unwrap_err();
+    assert!(error.to_string().contains("base reload duration"));
+}
+
+#[test]
+fn inactive_reload_adjustments_leave_the_base_duration() {
     for (base, single) in [(2.5, false), (0.4, true)] {
-        abilities["records"][0]["definition"]["m_mapWeaponInfos"]["primary"] = json!({
-            "m_reloadDuration":base, "m_bReloadSingleBullets":single,
-            "m_flReloadSingleBulletsInitialDelay":0.7, "m_iClipSize":30
-        });
-        std::fs::write(&ability_path, serde_json::to_vec(&abilities).unwrap()).unwrap();
-        let catalog = StatCatalog::from_directory(folder.path()).unwrap();
-        let (inactive, _, _) = stat_result(&catalog, false, HeroStat::ReloadTime);
-        let (active, trace, ignored) = stat_result(&catalog, true, HeroStat::ReloadTime);
-        assert_eq!(inactive.unwrap(), base);
-        assert!((active.unwrap() - base * 0.8).abs() < 1e-12);
+        let catalog = reload_catalog(base, single);
+        assert_eq!(
+            stat_result(&catalog, false, HeroStat::ReloadTime)
+                .0
+                .unwrap(),
+            base
+        );
+    }
+}
+
+#[test]
+fn active_reload_adjustments_count_duplicate_bindings_once() {
+    for (base, single) in [(2.5, false), (0.4, true)] {
+        let catalog = reload_catalog(base, single);
+        let (value, trace, ignored) = stat_result(&catalog, true, HeroStat::ReloadTime);
+        assert!((value.unwrap() - base * 0.8).abs() < 1e-12);
         assert!(ignored.is_empty());
         assert_eq!(trace.len(), 2);
         assert_eq!(trace[0].value, base);
@@ -2884,54 +2958,46 @@ fn reload_time_uses_catalog_duration_and_only_effective_adjustments() {
         assert_eq!(trace[1].modifier_serial, Some(42));
         assert!(trace.iter().all(|c| c.input == "reload_time"));
     }
+}
 
-    // An intrinsic property also applies without a modifier binding.
-    abilities["records"][0]["stat_changes"][0] = json!({
-        "stat":stat, "value":-10, "definition_path":"/test_gun/passive",
-        "usage_flags":"IntrinsicallyProvidedInAbility"
-    });
-    std::fs::write(&ability_path, serde_json::to_vec(&abilities).unwrap()).unwrap();
-    let catalog = StatCatalog::from_directory(folder.path()).unwrap();
-    assert!(
-        (stat_result(&catalog, false, HeroStat::ReloadTime)
-            .0
-            .unwrap()
-            - 0.36)
-            .abs()
-            < 1e-12
-    );
-    // Do not assume additive or multiplicative stacking from VData names.
-    assert!(
-        stat_result(&catalog, true, HeroStat::ReloadTime)
-            .0
-            .unwrap_err()
-            .to_string()
-            .contains("combining")
-    );
+#[test]
+fn intrinsic_reload_adjustments_need_no_modifier_binding() {
+    let value = stat_result(&passive_reload_catalog(), false, HeroStat::ReloadTime)
+        .0
+        .unwrap();
+    assert!((value - 0.36).abs() < 1e-12);
+}
 
-    abilities["records"][0]["stat_changes"][0]["usage_flags"] = json!("ConditionallyApplied");
-    std::fs::write(&ability_path, serde_json::to_vec(&abilities).unwrap()).unwrap();
-    let catalog = StatCatalog::from_directory(folder.path()).unwrap();
-    assert!(
-        stat_result(&catalog, false, HeroStat::ReloadTime)
-            .0
-            .unwrap_err()
-            .to_string()
-            .contains("conditional")
-    );
+#[test]
+fn reload_time_reports_unknown_adjustment_stacking() {
+    let error = stat_result(&passive_reload_catalog(), true, HeroStat::ReloadTime)
+        .0
+        .unwrap_err();
+    assert!(error.to_string().contains("combining"));
+}
 
-    abilities["records"][0]["stat_changes"] = json!([]);
-    abilities["records"][0]["definition"]["m_mapWeaponInfos"]["primary"]["m_bReloadUseActiveWeaponInfoDuration"] =
+#[test]
+fn reload_time_requires_evidence_for_a_conditional_adjustment() {
+    let mut catalog = passive_reload_catalog();
+    catalog.abilities.get_mut(&123).unwrap().stat_changes[0]["usage_flags"] =
+        json!("ConditionallyApplied");
+    let error = stat_result(&catalog, false, HeroStat::ReloadTime)
+        .0
+        .unwrap_err();
+    assert!(error.to_string().contains("conditional"));
+}
+
+#[test]
+fn reload_time_reports_dynamic_weapon_durations() {
+    let mut catalog = reload_catalog(0.4, true);
+    let weapon = catalog.abilities.get_mut(&123).unwrap();
+    weapon.stat_changes.clear();
+    weapon.definition["m_mapWeaponInfos"]["primary"]["m_bReloadUseActiveWeaponInfoDuration"] =
         json!(true);
-    std::fs::write(&ability_path, serde_json::to_vec(&abilities).unwrap()).unwrap();
-    let catalog = StatCatalog::from_directory(folder.path()).unwrap();
-    assert!(
-        stat_result(&catalog, false, HeroStat::ReloadTime)
-            .0
-            .unwrap_err()
-            .to_string()
-            .contains("dynamic weapon")
-    );
+    let error = stat_result(&catalog, false, HeroStat::ReloadTime)
+        .0
+        .unwrap_err();
+    assert!(error.to_string().contains("dynamic weapon"));
 }
 
 #[test]
@@ -3052,8 +3118,7 @@ fn missing_and_ambiguous_sources_are_reported_once_without_losing_known_totals()
     assert!(ignored[&6].contains("ambiguous modifier ID 6"));
 }
 
-#[test]
-fn powerup_uses_catalog_range_and_application_time() {
+fn powerup_effect(effect: &Value, applied: Option<f32>) -> Result<f64> {
     let folder = super::super::catalog::tests::fixture();
     let catalog = StatCatalog::from_directory(folder.path()).unwrap();
     let ctx = Context::new(1.0 / 64.0).unwrap();
@@ -3076,40 +3141,55 @@ fn powerup_uses_catalog_range_and_application_time() {
         unmapped_inputs: BTreeSet::new(),
     };
     let source: Record = serde_json::from_value(json!({"record_key":"misc#/any_powerup", "definition_path":"/any_powerup", "definition":{"m_flTimeMin":5,"m_flTimeMax":15}, "stat_changes":[]})).unwrap();
-    let effect = json!({"value_min":10, "value_max":30});
-    let mut entry = CModifierTableEntry {
-        last_applied_time: Some(700.0),
+    let entry = applied.map(|time| CModifierTableEntry {
+        last_applied_time: Some(time),
         ..Default::default()
-    };
-    assert_eq!(
-        resolver.effect(&effect, &source, Some(&entry)).unwrap(),
-        20.0
-    );
-    entry.last_applied_time = Some(100.0);
-    assert_eq!(
-        resolver.effect(&effect, &source, Some(&entry)).unwrap(),
-        10.0
-    );
-    entry.last_applied_time = Some(2000.0);
-    assert_eq!(
-        resolver.effect(&effect, &source, Some(&entry)).unwrap(),
-        30.0
-    );
-    assert!(resolver.effect(&effect, &source, None).is_err());
-    let zero_scale = json!({"value":10,"scaling":{"$value":{"_class":"scale_function_tech_damage", "m_flStatScale":0}}});
-    assert_eq!(resolver.effect(&zero_scale, &source, None).unwrap(), 10.0);
-    let disabled_scale = json!({"value":10,"scaling":{"$value":{
+    });
+    resolver.effect(effect, &source, entry.as_ref())
+}
+
+#[test]
+fn powerup_value_uses_its_application_time_and_catalog_bounds() {
+    let effect = json!({"value_min":10, "value_max":30});
+    for (applied, expected) in [(700.0, 20.0), (100.0, 10.0), (2000.0, 30.0)] {
+        assert_eq!(powerup_effect(&effect, Some(applied)).unwrap(), expected);
+    }
+}
+
+#[test]
+fn powerup_value_requires_an_application_time() {
+    assert!(powerup_effect(&json!({"value_min":10, "value_max":30}), None).is_err());
+}
+
+#[test]
+fn zero_scaling_preserves_the_flat_effect() {
+    let effect = json!({"value":10,"scaling":{"$value":{
+        "_class":"scale_function_tech_damage", "m_flStatScale":0
+    }}});
+    assert_eq!(powerup_effect(&effect, None).unwrap(), 10.0);
+}
+
+#[test]
+fn disabled_scaling_preserves_the_flat_effect() {
+    let effect = json!({"value":10,"scaling":{"$value":{
         "_class":"scale_function_single_stat", "m_eSpecificStatScaleType":"ETechPower",
         "m_flStatScale":0.2,"m_bFunctionDisabled":true
     }}});
-    assert_eq!(
-        resolver.effect(&disabled_scale, &source, None).unwrap(),
-        10.0
-    );
-    let nonzero_scale = json!({"value":10,"scaling":{"$value":{"_class":"scale_function_tech_damage", "m_flStatScale":0.2}}});
-    assert!(resolver.effect(&nonzero_scale, &source, None).is_err());
-    let unsupported = json!({"value":10,"scaling":{"$value":{"_class":"unknown"}}});
-    assert!(resolver.effect(&unsupported, &source, None).is_err());
+    assert_eq!(powerup_effect(&effect, None).unwrap(), 10.0);
+}
+
+#[test]
+fn active_scaling_requires_its_inputs() {
+    let effect = json!({"value":10,"scaling":{"$value":{
+        "_class":"scale_function_tech_damage", "m_flStatScale":0.2
+    }}});
+    assert!(powerup_effect(&effect, None).is_err());
+}
+
+#[test]
+fn unknown_scaling_returns_an_error() {
+    let effect = json!({"value":10,"scaling":{"$value":{"_class":"unknown"}}});
+    assert!(powerup_effect(&effect, None).is_err());
 }
 
 #[test]

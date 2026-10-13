@@ -30,10 +30,14 @@ pub fn calculate(percent: f64) -> Result<f64, CalculationError> {
 mod tests {
     use super::*;
     #[test]
-    fn preserves_percentage_points_and_rejects_invalid_inputs() {
+    fn preserves_percentage_points() {
         for value in [0.0, 37.5, 100.0] {
             assert_eq!(calculate(value).unwrap(), value);
         }
+    }
+
+    #[test]
+    fn rejects_invalid_inputs() {
         for value in [f64::NAN, f64::INFINITY, -0.1, 100.1] {
             assert!(calculate(value).is_err());
         }

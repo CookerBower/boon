@@ -448,13 +448,17 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn byte_loader_matches_directory_and_rejects_invalid_catalogs() {
-        let bytes = serde_json::to_vec(&json!({
+    fn state_catalog_bytes() -> Vec<u8> {
+        serde_json::to_vec(&json!({
             "catalog":"modifiers", "client_version":"12345", "source_commit":"test",
             "modifier_states":{"2":"MODIFIER_STATE_STUNNED"},
         }))
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn byte_loader_matches_directory() {
+        let bytes = state_catalog_bytes();
         let folder = tempfile::tempdir().unwrap();
         fs::write(folder.path().join("modifiers.json"), &bytes).unwrap();
         let direct = StateCatalog::from_json_bytes(&bytes).unwrap();
@@ -462,8 +466,16 @@ mod tests {
         assert_eq!(direct.client_version, directory.client_version);
         assert_eq!(direct.source_commit, directory.source_commit);
         assert_eq!(direct.decode(&[4, 1]), directory.decode(&[4, 1]));
+    }
+
+    #[test]
+    fn byte_loader_rejects_invalid_json() {
         assert!(StateCatalog::from_json_bytes(b"not json").is_err());
-        let mut wrong: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    }
+
+    #[test]
+    fn byte_loader_requires_a_modifier_catalog() {
+        let mut wrong: serde_json::Value = serde_json::from_slice(&state_catalog_bytes()).unwrap();
         wrong["catalog"] = json!("abilities");
         assert!(StateCatalog::from_json_bytes(&serde_json::to_vec(&wrong).unwrap()).is_err());
     }

@@ -491,15 +491,22 @@ pub(super) mod tests {
         folder
     }
 
+    fn catalog_files() -> [Vec<u8>; 4] {
+        let folder = fixture();
+        ["heroes", "abilities", "modifiers", "misc"]
+            .map(|name| fs::read(folder.path().join(format!("{name}.json"))).unwrap())
+    }
+
+    fn from_files(files: &[Vec<u8>; 4]) -> Result<StatCatalog> {
+        StatCatalog::from_json_bytes(&files[0], &files[1], &files[2], &files[3])
+    }
+
     #[test]
-    fn byte_loader_matches_directory_and_preserves_validation() {
+    fn byte_loader_matches_directory() {
         let folder = fixture();
         let names = ["heroes", "abilities", "modifiers", "misc"];
         let files = names.map(|name| fs::read(folder.path().join(format!("{name}.json"))).unwrap());
-        let load = |files: &[Vec<u8>; 4]| {
-            StatCatalog::from_json_bytes(&files[0], &files[1], &files[2], &files[3])
-        };
-        let bytes = load(&files).unwrap();
+        let bytes = from_files(&files).unwrap();
         let directory = StatCatalog::from_directory(folder.path()).unwrap();
         assert_eq!(bytes.data_version, directory.data_version);
         assert_eq!(bytes.snapshot_version, directory.snapshot_version);
@@ -515,20 +522,40 @@ pub(super) mod tests {
             bytes.modifier(10, None).unwrap().stat_changes,
             directory.modifier(10, None).unwrap().stat_changes
         );
+    }
+
+    #[test]
+    fn byte_loader_rejects_invalid_json_in_each_catalog() {
+        let files = catalog_files();
         for index in 0..4 {
             let mut broken = files.clone();
             broken[index] = b"not json".to_vec();
-            assert!(load(&broken).is_err());
-            let file: Value = serde_json::from_slice(&files[index]).unwrap();
-            for (key, value) in [
-                ("catalog", json!("wrong")),
-                ("client_version", json!("other")),
-                ("source_commit", json!("other")),
-            ] {
-                let mut changed = file.clone();
-                changed[key] = value;
-                broken[index] = serde_json::to_vec(&changed).unwrap();
-                assert!(load(&broken).is_err(), "{index} {key}");
+            assert!(from_files(&broken).is_err(), "catalog {index}");
+        }
+    }
+
+    #[test]
+    fn byte_loader_rejects_the_wrong_catalog_kind() {
+        let files = catalog_files();
+        for index in 0..4 {
+            let mut broken = files.clone();
+            let mut file: Value = serde_json::from_slice(&files[index]).unwrap();
+            file["catalog"] = json!("wrong");
+            broken[index] = serde_json::to_vec(&file).unwrap();
+            assert!(from_files(&broken).is_err(), "catalog {index}");
+        }
+    }
+
+    #[test]
+    fn byte_loader_requires_matching_snapshot_metadata() {
+        let files = catalog_files();
+        for index in 0..4 {
+            for key in ["client_version", "source_commit"] {
+                let mut broken = files.clone();
+                let mut file: Value = serde_json::from_slice(&files[index]).unwrap();
+                file[key] = json!("other");
+                broken[index] = serde_json::to_vec(&file).unwrap();
+                assert!(from_files(&broken).is_err(), "{index} {key}");
             }
         }
     }
@@ -602,20 +629,22 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn rejects_mixed_snapshots_and_old_catalogs() {
+    fn directory_loader_rejects_mixed_snapshots() {
         let folder = fixture();
-        let path = folder.path().join("misc.json");
         fs::write(
-            &path,
+            folder.path().join("misc.json"),
             r#"{"catalog":"misc","client_version":"1","source_commit":"other","records":[]}"#,
         )
         .unwrap();
-        assert!(
-            StatCatalog::from_directory(folder.path())
-                .unwrap_err()
-                .to_string()
-                .contains("different snapshots")
-        );
+        let error = StatCatalog::from_directory(folder.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("different snapshots"));
+    }
+
+    #[test]
+    fn directory_loader_explains_how_to_replace_an_old_catalog() {
+        let folder = fixture();
         fs::write(folder.path().join("heroes.json"), r#"{"catalog":"heroes","client_version":"12345","source_commit":"test-commit","records":[{"hero_id":999,"definition":{}}]}"#).unwrap();
         let error = StatCatalog::from_directory(folder.path())
             .unwrap_err()
