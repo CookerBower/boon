@@ -629,6 +629,8 @@ class Demo:
         entity index and leave identity and last-seen columns null.
         `target_steam_id` is present only when one active controller with a
         recorded Steam ID points to that exact pawn lifetime.
+        Omit both arguments for all ticks. Pass either exact ``ticks`` or a
+        positive ``every`` interval. An empty tick list returns an empty frame.
         """
         ...
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.17.0
+
+- Add current `upgrade_ids` and optional recorded `boon_count` to player snapshots.
+- Add `enemy_minimap_ticks()` for each team's recorded enemy hero icons and last-seen positions.
+- Add objective `entity_serial`. Keep health records separate when an entity slot is used again.
+- Decode signed entity indices. Cache field keys in shared Rust readers.
+- Support Python 3.15.
+
 ## 0.16.0
 
 - Update protobufs to Deadlock 6774 (`boon-proto 0.4.11112755+6774`).

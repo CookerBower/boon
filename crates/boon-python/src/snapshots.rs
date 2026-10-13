@@ -282,38 +282,33 @@ impl PtKeys {
     }
 }
 
-/// The controller's recorded current upgrade vector. An empty list means the
-/// source explicitly contains zero entries; `None` means it was unavailable or
-/// an entry could not be decoded. The vector can contain hero abilities as well
-/// as purchased items, so consumers must classify its tokens with game data.
-fn recorded_upgrade_ids(
-    ctx: &boon_parser::Context,
-    controller: &boon_parser::Entity,
-) -> Option<Vec<u32>> {
-    use boon_parser::FieldValue;
-    let serializer = ctx.serializers().get(&controller.class_name)?;
-    let path = "m_PlayerDataGlobal.m_vecUpgrades";
-    let count = match controller.get_by_name(path, serializer)? {
-        FieldValue::I32(n) if *n >= 0 => *n as usize,
-        FieldValue::U32(n) => *n as usize,
-        FieldValue::I64(n) if *n >= 0 => usize::try_from(*n).ok()?,
-        FieldValue::U64(n) => usize::try_from(*n).ok()?,
-        _ => return None,
-    };
-    if count > 64 {
-        return None;
+/// Append inventories directly to Arrow; keep no allocation per player row.
+struct UpgradeCols {
+    reader: Option<boon_parser::replay_inputs::UpgradeReader>,
+    builder: ListPrimitiveChunkedBuilder<UInt32Type>,
+}
+
+impl Default for UpgradeCols {
+    fn default() -> Self {
+        Self {
+            reader: None,
+            builder: ListPrimitiveChunkedBuilder::new("upgrade_ids".into(), 0, 0, DataType::UInt32),
+        }
     }
-    (0..count)
-        .map(
-            |i| match controller.get_by_name(&format!("{path}.{i}"), serializer)? {
-                FieldValue::I32(n) if *n >= 0 => Some(*n as u32),
-                FieldValue::U32(n) => Some(*n),
-                FieldValue::I64(n) if *n >= 0 => u32::try_from(*n).ok(),
-                FieldValue::U64(n) => u32::try_from(*n).ok(),
-                _ => None,
-            },
-        )
-        .collect()
+}
+
+impl UpgradeCols {
+    fn append(&mut self, ctx: &boon_parser::Context, controller: &boon_parser::Entity) {
+        let reader = self.reader.get_or_insert_with(|| {
+            boon_parser::replay_inputs::UpgradeReader::new(
+                ctx.serializers().get(&controller.class_name),
+            )
+        });
+        match reader.read(controller) {
+            Some(ids) => self.builder.append_slice(ids),
+            None => self.builder.append_null(),
+        }
+    }
 }
 
 /// Player positions used by analyses that do not need all player-tick columns.
@@ -510,7 +505,7 @@ pub(super) struct PtCols {
     pub(super) deaths: Vec<i64>,
     pub(super) assists: Vec<i64>,
     pub(super) boon_count: Vec<Option<i64>>,
-    pub(super) upgrade_ids: Vec<Option<Vec<u32>>>,
+    upgrade_ids: UpgradeCols,
 }
 
 impl PtCols {
@@ -620,28 +615,13 @@ impl PtCols {
                     _ => None,
                 }
             }));
-            self.upgrade_ids.push(recorded_upgrade_ids(ctx, ctrl));
+            self.upgrade_ids.append(ctx, ctrl);
         }
     }
 
     /// Build the `player_ticks` DataFrame. Column order/names must match `load()`.
-    pub(super) fn into_dataframe(self) -> PyResult<DataFrame> {
-        let mut upgrade_ids = ListPrimitiveChunkedBuilder::<UInt32Type>::new(
-            "upgrade_ids".into(),
-            self.upgrade_ids.len(),
-            self.upgrade_ids
-                .iter()
-                .filter_map(Option::as_ref)
-                .map(Vec::len)
-                .sum(),
-            DataType::UInt32,
-        );
-        for ids in &self.upgrade_ids {
-            match ids {
-                Some(ids) => upgrade_ids.append_slice(ids),
-                None => upgrade_ids.append_null(),
-            }
-        }
+    pub(super) fn into_dataframe(mut self) -> PyResult<DataFrame> {
+        let upgrade_ids = self.upgrade_ids.builder.finish();
         df_from_columns(vec![
             numeric_column("tick", self.tick),
             Column::new("steam_id".into(), self.steam_id),
@@ -696,7 +676,7 @@ impl PtCols {
             numeric_column("deaths", self.deaths),
             numeric_column("assists", self.assists),
             Column::new("boon_count".into(), self.boon_count),
-            upgrade_ids.finish().into_column(),
+            upgrade_ids.into_column(),
         ])
         .map_err(|e| InvalidDemoError::new_err(format!("Failed to create DataFrame: {e}")))
     }
