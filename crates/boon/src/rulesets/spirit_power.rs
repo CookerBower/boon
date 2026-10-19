@@ -1,5 +1,13 @@
 //! Multiply global spirit sources, then add catalog-declared post-multiplier bonuses.
-use crate::hero_stats::CalculationError;
+use super::Rule;
+use crate::hero_stats::{CalculationError, HeroStat};
+
+pub const V1: Rule = Rule {
+    stat: HeroStat::SpiritPower,
+    id: "spirit_power.v1",
+    version: 1,
+    documented_on: "2026-10-19",
+};
 
 #[derive(Debug)]
 pub(crate) struct Modifiers {

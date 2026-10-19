@@ -62,6 +62,7 @@ pub enum HeroStat {
     AirDashDuration,
     MoveSpeed,
     SprintSpeed,
+    SpiritPower,
 }
 
 impl HeroStat {
@@ -95,6 +96,7 @@ impl HeroStat {
             Self::AirDashDuration => "air_dash_duration",
             Self::MoveSpeed => "move_speed",
             Self::SprintSpeed => "sprint_speed",
+            Self::SpiritPower => "spirit_power",
         }
     }
 
@@ -122,7 +124,7 @@ impl HeroStat {
             | Self::StaminaCooldown
             | Self::DashDuration
             | Self::AirDashDuration => "s",
-            Self::Stamina => "points",
+            Self::Stamina | Self::SpiritPower => "points",
             Self::FalloffStart | Self::FalloffEnd => "m",
             Self::LightMeleeDamage | Self::HeavyMeleeDamage => "damage",
             Self::GravityScale => "multiplier",
@@ -159,6 +161,7 @@ impl HeroStat {
             Self::AirDashDuration => rulesets::air_dash_duration::V1,
             Self::MoveSpeed => rulesets::move_speed::V1,
             Self::SprintSpeed => rulesets::sprint_speed::V1,
+            Self::SpiritPower => rulesets::spirit_power::V1,
         }
     }
 }
@@ -196,6 +199,7 @@ impl std::str::FromStr for HeroStat {
             "air_dash_duration" => Ok(Self::AirDashDuration),
             "move_speed" => Ok(Self::MoveSpeed),
             "sprint_speed" => Ok(Self::SprintSpeed),
+            "spirit_power" => Ok(Self::SpiritPower),
             _ => Err(CalculationError::Invalid(format!(
                 "unsupported hero stat {value}"
             ))),

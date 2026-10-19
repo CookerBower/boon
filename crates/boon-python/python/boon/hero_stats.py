@@ -51,6 +51,7 @@ class HeroStat(StrEnum):
     AIR_DASH_DURATION = "air_dash_duration"
     MOVE_SPEED = "move_speed"
     SPRINT_SPEED = "sprint_speed"
+    SPIRIT_POWER = "spirit_power"
 
 
 class StatMode(StrEnum):

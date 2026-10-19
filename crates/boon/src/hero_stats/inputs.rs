@@ -254,6 +254,7 @@ pub(super) fn collect(
                             }
                             HeroStat::GravityScale => resolver.gravity_scale(),
                             HeroStat::Stamina => resolver.stamina(inputs),
+                            HeroStat::SpiritPower => resolver.spirit(inputs),
                             HeroStat::DebuffResist => resolver.debuff_resist(inputs),
                             HeroStat::BulletResist
                             | HeroStat::SpiritResist

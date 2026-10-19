@@ -22,6 +22,7 @@ Select stats with these strings or enum members. Names are case-sensitive.
 | `gravity_scale` | `HeroStat.GRAVITY_SCALE` | `HeroStat::GravityScale` | `multiplier` |
 | `stamina` | `HeroStat.STAMINA` | `HeroStat::Stamina` | `points` |
 | `stamina_cooldown` | `HeroStat.STAMINA_COOLDOWN` | `HeroStat::StaminaCooldown` | `s` |
+| `spirit_power` | `HeroStat.SPIRIT_POWER` | `HeroStat::SpiritPower` | `points` |
 | `dash_speed` | `HeroStat.DASH_SPEED` | `HeroStat::DashSpeed` | `m/s` |
 | `dash_duration` | `HeroStat.DASH_DURATION` | `HeroStat::DashDuration` | `s` |
 | `air_dash_speed` | `HeroStat.AIR_DASH_SPEED` | `HeroStat::AirDashSpeed` | `m/s` |

@@ -333,6 +333,7 @@ fn stat_result_with_modifier(
         }
         HeroStat::GravityScale => resolver.gravity_scale(),
         HeroStat::Stamina => resolver.stamina(&inputs),
+        HeroStat::SpiritPower => resolver.spirit(&inputs),
         HeroStat::DebuffResist => resolver.debuff_resist(&inputs),
         HeroStat::BulletResist | HeroStat::SpiritResist | HeroStat::MeleeResist => {
             resolver.resistance(&inputs, stat)
@@ -920,6 +921,22 @@ fn movement_and_sprint_spirit_scaling_are_data_driven() {
         assert_eq!(row.value, scale);
         assert!(row.definition_path.contains("m_mapScalingStats"));
     }
+}
+
+#[test]
+fn spirit_power_is_a_stat_with_the_catalog_base() {
+    let folder = super::super::catalog::tests::fixture();
+    let path = folder.path().join("heroes.json");
+    let mut heroes: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    heroes["records"][0]["definition"]["m_mapStartingStats"] = json!({"ETechPower":20});
+    heroes["records"][0]["definition"]["m_mapLevelInfo"] = json!({});
+    std::fs::write(&path, serde_json::to_vec(&heroes).unwrap()).unwrap();
+    let catalog = StatCatalog::from_directory(folder.path()).unwrap();
+    let (value, trace, _) = stat_result(&catalog, false, HeroStat::SpiritPower);
+    assert_eq!(value.unwrap(), 20.0);
+    assert!(trace.iter().any(|r| r.input == "spirit_power" && r.kind == "base"));
+    assert_eq!(HeroStat::SpiritPower.unit(), "points");
+    assert_eq!("spirit_power".parse::<HeroStat>().unwrap(), HeroStat::SpiritPower);
 }
 
 #[test]
